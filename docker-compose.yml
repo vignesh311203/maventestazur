@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: realestate
       POSTGRES_USER: app
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d realestate"]
@@ -19,9 +19,9 @@ services:
     build: ./backend
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://app:change-me@db:5432/realestate
+      DATABASE_URL: postgresql+psycopg://app:${POSTGRES_PASSWORD:-change-me}@db:5432/realestate
       REDIS_URL: redis://redis:6379/0
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_started}
@@ -30,7 +30,7 @@ services:
       context: ./frontend
       args:
         VITE_API_URL: http://localhost:8000
-    ports: ["5173:80"]
+    ports: ["127.0.0.1:5173:80"]
     depends_on: [api]
 
 volumes:
