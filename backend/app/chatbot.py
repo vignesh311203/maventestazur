@@ -25,7 +25,7 @@ def has(text, words):
 
 def phone_from(text):
     value = text.strip()
-    if PHONE.fullmatch(value) and 7 <= sum(c.isdigit() for c in value) <= 15:
+    if PHONE.fullmatch(value) and value.isascii() and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value) and 7 <= sum(c.isdigit() for c in value) <= 15:
         return value
     return None
 
@@ -65,7 +65,7 @@ def info(text, projects, available):
 def respond(body, full_name, state=None, projects=None, available=0):
     projects = projects or []
     state = state or {}
-    name = (full_name or "there").split()[0]
+    name = ((full_name or "").split() or ["there"])[0]
     text = body.strip().casefold().rstrip("!.")
     flow = state.get("flow")
     slots = dict(state.get("slots") or {})

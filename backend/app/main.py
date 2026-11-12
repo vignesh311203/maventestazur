@@ -9,14 +9,14 @@ import hashlib
 import hmac
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     trusted_hosts: str = "localhost,127.0.0.1,testserver"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
+    google_sheets_enabled: bool = False
+    google_sheet_id: str = ""
+    google_service_account_json: SecretStr = SecretStr("")
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
@@ -648,3 +651,69 @@ def send_admin_message(request: Request, customer_id: int, data: SupportMessageI
     if not customer.is_active:
         raise HTTPException(status_code=409, detail="Customer account is inactive")
     return save_support(db, customer_id, "admin", data)
+
+
+# Durable reporting change markers. These contain no customer data or credentials.
+class SheetOutbox(Base):
+    __tablename__ = "sheet_outbox"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class SheetSyncStatus(Base):
+    __tablename__ = "sheet_sync_status"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sheet_id: Mapped[str] = mapped_column(String(200), default="")
+    last_success: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(String(200), default="")
+
+
+@event.listens_for(Session, "before_flush")
+def queue_reporting_changes(db, flush_context, instances):
+    watched = (Lead, SupportMessage, Plot, Referral, User)
+    if any(isinstance(obj, watched) for obj in db.new.union(db.deleted)) or any(isinstance(obj, watched) and db.is_modified(obj, include_collections=False) for obj in db.dirty):
+        db.add(SheetOutbox())
+
+
+@app.get("/api/admin/sheets/status")
+def sheets_status(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import configured
+    state = db.get(SheetSyncStatus, 1)
+    same = bool(state and state.sheet_id == settings.google_sheet_id)
+    return {"configured": configured(settings), "pending_changes": db.scalar(select(func.count(SheetOutbox.id))) or 0,
+            "last_success": state.last_success.isoformat() if same and state.last_success else None,
+            "last_error": state.last_error if state else "", "sheet_url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheet_id if configured(settings) else None}
+
+
+@app.post("/api/admin/sheets/sync", status_code=202)
+@limiter.limit("5/minute")
+def request_sheet_sync(request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import configured
+    if not configured(settings):
+        raise HTTPException(status_code=409, detail="Google Sheets is not configured")
+    db.add(SheetOutbox())
+    db.commit()
+    return {"message": "Sync queued. Check status for completion."}
+
+
+@app.get("/api/admin/sheets/export")
+@limiter.limit("5/minute")
+def export_reporting_data(request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import snapshot, export_zip
+    return Response(export_zip(snapshot(db)), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="metroestate-private-report.zip"'})
+
+
+@app.on_event("startup")
+def start_sheets_worker():
+    from . import main
+    from .sheet_sync import start_worker
+    app.state.sheet_stop, app.state.sheet_worker = start_worker(main)
+
+
+@app.on_event("shutdown")
+def stop_sheets_worker():
+    stop = getattr(app.state, "sheet_stop", None)
+    worker = getattr(app.state, "sheet_worker", None)
+    if stop:
+        stop.set()
+    if worker:
+        worker.join(timeout=2)
