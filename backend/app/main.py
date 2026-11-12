@@ -529,6 +529,15 @@ async def whatsapp_webhook(request: Request):
         for entry in payload.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                for status_event in value.get("statuses", []):
+                    provider_id = status_event.get("id")
+                    state = status_event.get("status", "")
+                    if provider_id and state in {"sent","delivered","read","failed"}:
+                        delivery = db.scalar(select(WhatsAppDelivery).where(WhatsAppDelivery.provider_message_id == provider_id))
+                        if delivery:
+                            delivery.status = state
+                            errors = status_event.get("errors") or []
+                            if errors: delivery.error_code = str(errors[0].get("code", "provider_error"))[:80]
                 for message in value.get("messages", []):
                     msg_id = message.get("id")
                     sender = message.get("from", "")
