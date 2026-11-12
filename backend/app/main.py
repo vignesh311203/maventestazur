@@ -208,7 +208,7 @@ def growth(initial_value: float = Query(gt=0), annual_growth_percent: float = Qu
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(db_session), user: User = Depends(current_user)):
     query = select(Lead).order_by(Lead.created_at.desc())
-    if user.role not in (Role.admin.value, Role.agent.value): query = query.where(Lead.owner_id == user.id)
+    if user.role != Role.admin.value: query = query.where(Lead.owner_id == user.id)
     return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "consent_whatsapp": x.consent_whatsapp} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
@@ -221,7 +221,7 @@ def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = De
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(current_user)):
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
     lead = db.get(Lead, lead_id)
-    if not lead or (user.role not in (Role.admin.value, Role.agent.value) and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
+    if not lead or (user.role != Role.admin.value and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
