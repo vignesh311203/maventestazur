@@ -63,6 +63,12 @@ try{
   await page.getByText(/You can view available plot prices/).waitFor();
   assert.equal((await page.request.get(api+"/api/admin/messages",{headers:customerHeaders})).status(),403);
   console.log("PASS private customer chat and automatic price guidance");
+  for(const [label,expected] of [["Book Site Visit","Your site-visit request has been saved"],["Request Brochure","Your brochure request has been saved"],["Call Me Back","Your callback request has been saved"]]){
+    await page.getByRole("button",{name:label,exact:true}).click();
+    await page.getByRole("log").getByText(expected,{exact:false}).waitFor();
+    await page.getByRole("button",{name:label,exact:true}).isEnabled();
+  }
+  console.log("PASS all three customer quick actions and automatic confirmations");
   await page.goto(web+"/admin");await signIn(customerEmail,customerPassword);await page.getByText(/cannot access this panel/).waitFor();assert.equal(await page.getByRole("heading",{name:"Registered users"}).count(),0);
   console.log("PASS customer denied admin panel");
   await signIn(adminEmail,adminPassword);await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();await nav("Reviews");await page.getByLabel("Customer account ID").fill(String(customer.user.id));await page.getByRole("checkbox",{name:/explicitly agreed/}).check();const review=page.waitForResponse(r=>r.url().endsWith("/api/reviews/requests")&&r.request().method()==="POST");await page.getByRole("button",{name:"Record review request"}).click();assert.equal((await review).status(),201);
@@ -70,6 +76,9 @@ try{
   await nav("Messages");await page.getByRole("heading",{name:"Customer messages",exact:true}).waitFor();
   await page.getByRole("button").filter({hasText:customerEmail}).click();
   await page.getByRole("log").getByText("What is the plot price?",{exact:true}).waitFor();
+  await page.getByRole("log").getByText("Book Site Visit",{exact:true}).waitFor();
+  await page.getByRole("log").getByText("Request Brochure",{exact:true}).waitFor();
+  await page.getByRole("log").getByText("Call Me Back",{exact:true}).waitFor();
   await page.getByLabel("Reply to customer",{exact:true}).fill("Please share your preferred project.");
   const reply=page.waitForResponse(r=>r.url().includes("/api/admin/messages/")&&r.request().method()==="POST");
   await page.getByRole("button",{name:"Send message",exact:true}).click();assert.equal((await reply).status(),201);
