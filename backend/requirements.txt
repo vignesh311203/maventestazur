@@ -10,3 +10,4 @@ slowapi>=0.1.9,<1
 redis>=5,<7
 pytest>=8,<9
 httpx>=0.27,<1
+alembic>=1.14,<2
