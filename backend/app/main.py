@@ -58,7 +58,8 @@ class Lead(Base):
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interest: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(30), default="new")
-    consent_whatsapp: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Retain legacy database column for compatibility; no messaging or consent collection uses it.
+    _legacy_consent: Mapped[bool] = mapped_column("consent_whatsapp", Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Plot(Base):
@@ -128,7 +129,6 @@ class LeadIn(BaseModel):
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
     interest: str = Field(default="", max_length=255)
-    consent_whatsapp: bool = False
 class PlotIn(BaseModel):
     project: str = Field(min_length=2, max_length=160)
     plot_number: str = Field(min_length=1, max_length=40)
@@ -142,7 +142,7 @@ class ReferralIn(BaseModel):
     referred_phone: str = Field(min_length=7, max_length=30)
 class ReviewIn(BaseModel):
     customer_id: int
-    channel: str = Field(default="manual", pattern="^(manual|whatsapp|email)$")
+    channel: str = Field(default="manual", pattern="^(manual|email)$")
     consent_confirmed: bool
 
 def issue_token(user: User) -> str:
@@ -208,20 +208,30 @@ def growth(initial_value: float = Query(gt=0), annual_growth_percent: float = Qu
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(db_session), user: User = Depends(current_user)):
     query = select(Lead).order_by(Lead.created_at.desc())
-    if user.role not in (Role.admin.value, Role.agent.value): query = query.where(Lead.owner_id == user.id)
-    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "consent_whatsapp": x.consent_whatsapp} for x in db.scalars(query)]
+    if user.role != Role.admin.value: query = query.where(Lead.owner_id == user.id)
+    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
 def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(current_user)):
-    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(), email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), consent_whatsapp=data.consent_whatsapp)
+    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
+                email=str(data.email).lower() if data.email else None, interest=data.interest.strip())
     db.add(lead); db.commit(); db.refresh(lead)
-    return {"id": lead.id, "status": lead.status, "whatsapp_alert": "queued_only_when_integrated" if lead.consent_whatsapp else "no_consent"}
+    return {"id": lead.id, "status": lead.status}
+
+@app.get("/api/admin/lead-notifications")
+def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
+                       db: Session = Depends(db_session),
+                       user: User = Depends(require_roles(Role.admin))):
+    # New leads are durable notifications; changing lead status resolves the alert.
+    query = select(Lead).where(Lead.status == "new").order_by(Lead.created_at.desc(), Lead.id.desc()).limit(limit)
+    return [{"id": lead.id, "name": lead.name, "interest": lead.interest,
+             "created_at": lead.created_at.isoformat()} for lead in db.scalars(query)]
 
 @app.patch("/api/leads/{lead_id}/status")
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(current_user)):
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
     lead = db.get(Lead, lead_id)
-    if not lead or (user.role not in (Role.admin.value, Role.agent.value) and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
+    if not lead or (user.role != Role.admin.value and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
@@ -268,3 +278,123 @@ def bootstrap_admin():
         if not exists:
             db.add(User(email=settings.bootstrap_admin_email.lower(), full_name="Platform Admin", password_hash=password_hash.hash(settings.bootstrap_admin_password), role=Role.admin.value))
             db.commit()
+
+
+# --- Admin operations and editable business settings ---
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    value: Mapped[str] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class AdminAudit(Base):
+    __tablename__ = "admin_audit"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    action: Mapped[str] = mapped_column(String(100))
+    target: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+Base.metadata.create_all(bind=engine)
+DEFAULT_SETTINGS = {"registration_percent":"5.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
+
+class AdminUserIn(BaseModel):
+    email: EmailStr
+    full_name: str = Field(min_length=2, max_length=160)
+    password: str = Field(min_length=12, max_length=128)
+    role: Role
+class AdminSettingsIn(BaseModel):
+    registration_percent: float = Field(ge=0, le=100)
+    stamp_duty_percent: float = Field(ge=0, le=100)
+    other_charges: float = Field(ge=0, le=100000000)
+    referral_reward_amount: float = Field(ge=0, le=100000000)
+class ReferralDecisionIn(BaseModel):
+    status: str = Field(pattern="^(approved|rejected|paid)$")
+    reward_amount: float = Field(ge=0, le=100000000)
+class PlotUpdateIn(BaseModel):
+    project: str = Field(min_length=2, max_length=160)
+    plot_number: str = Field(min_length=1, max_length=40)
+    area_sqft: float = Field(gt=0, le=1000000)
+    rate_per_sqft: float = Field(gt=0, le=1000000)
+    status: str = Field(pattern="^(available|reserved|sold)$")
+    x: float = Field(ge=0, le=10000)
+    y: float = Field(ge=0, le=10000)
+
+def write_admin_audit(db: Session, actor: User, action: str, target: str = ""):
+    db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160]))
+    db.commit()
+
+@app.get("/api/settings/calculator")
+def calculator_settings(db: Session = Depends(db_session)):
+    rows = {x.key:x.value for x in db.scalars(select(AppSetting))}
+    return {k:float(rows.get(k,v)) for k,v in DEFAULT_SETTINGS.items() if k in {"registration_percent","stamp_duty_percent","other_charges"}}
+
+@app.get("/api/admin/settings")
+def admin_get_settings(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    rows = {x.key:x.value for x in db.scalars(select(AppSetting))}
+    return {k:float(rows.get(k,v)) for k,v in DEFAULT_SETTINGS.items()}
+
+@app.patch("/api/admin/settings")
+def admin_update_settings(data: AdminSettingsIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    for key,value in data.model_dump().items():
+        row = db.scalar(select(AppSetting).where(AppSetting.key==key))
+        if row: row.value=str(value)
+        else: db.add(AppSetting(key=key,value=str(value)))
+    db.commit()
+    write_admin_audit(db,user,"settings.updated",",".join(data.model_fields_set))
+    return data.model_dump()
+
+@app.get("/api/admin/users")
+def admin_list_users(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    return [{"id":x.id,"email":x.email,"full_name":x.full_name,"role":x.role,"is_active":x.is_active,"created_at":x.created_at.isoformat()} for x in db.scalars(select(User).order_by(User.id.desc()))]
+
+@app.post("/api/admin/users", status_code=201)
+def admin_create_user(data: AdminUserIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    email=data.email.lower()
+    if db.scalar(select(User).where(User.email==email)): raise HTTPException(status_code=409,detail="Email already registered")
+    created=User(email=email,full_name=data.full_name.strip(),password_hash=password_hash.hash(data.password),role=data.role.value)
+    db.add(created); db.commit(); db.refresh(created)
+    write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}")
+    return {"id":created.id,"email":created.email,"full_name":created.full_name,"role":created.role,"is_active":created.is_active}
+
+@app.patch("/api/admin/users/{user_id}/active")
+def admin_set_user_active(user_id:int, active:bool, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+    target=db.get(User,user_id)
+    if not target: raise HTTPException(status_code=404,detail="User not found")
+    if target.id==user.id and not active: raise HTTPException(status_code=400,detail="You cannot deactivate your own account")
+    target.is_active=active; db.commit()
+    write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}")
+    return {"id":target.id,"is_active":target.is_active}
+
+@app.get("/api/admin/referrals")
+def admin_list_referrals(db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+    return [{"id":x.id,"referrer_id":x.referrer_id,"referred_name":x.referred_name,"referred_phone":x.referred_phone,"status":x.status,"reward_amount":x.reward_amount} for x in db.scalars(select(Referral).order_by(Referral.id.desc()))]
+
+@app.patch("/api/admin/referrals/{referral_id}")
+def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+    item=db.get(Referral,referral_id)
+    if not item: raise HTTPException(status_code=404,detail="Referral not found")
+    item.status=data.status; item.reward_amount=data.reward_amount; db.commit()
+    write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}")
+    return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
+
+@app.patch("/api/admin/plots/{plot_id}")
+def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+    item=db.get(Plot,plot_id)
+    if not item: raise HTTPException(status_code=404,detail="Plot not found")
+    for key,value in data.model_dump().items(): setattr(item,key,value)
+    db.commit()
+    write_admin_audit(db,user,"plot.updated",str(item.id))
+    return {"id":item.id,**data.model_dump()}
+
+@app.get("/api/admin/audit")
+def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+    return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
+
+@app.on_event("startup")
+def seed_business_settings():
+    with SessionLocal() as db:
+        for key,value in DEFAULT_SETTINGS.items():
+            if not db.scalar(select(AppSetting).where(AppSetting.key==key)): db.add(AppSetting(key=key,value=value))
+        db.commit()
