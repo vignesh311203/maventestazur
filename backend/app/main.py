@@ -2,10 +2,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Generator
-import hashlib, hmac, json, re
-import httpx
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
@@ -25,14 +23,6 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
-    whatsapp_access_token: str = ""
-    whatsapp_phone_number_id: str = ""
-    whatsapp_verify_token: str = ""
-    whatsapp_app_secret: str = ""
-    whatsapp_graph_api_version: str = ""
-    whatsapp_alert_recipients: str = ""
-    whatsapp_lead_alert_template: str = ""
-    whatsapp_template_language: str = "en"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
@@ -68,7 +58,8 @@ class Lead(Base):
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interest: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(30), default="new")
-    consent_whatsapp: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Retain legacy database column for compatibility; no messaging or consent collection uses it.
+    _legacy_consent: Mapped[bool] = mapped_column("consent_whatsapp", Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Plot(Base):
@@ -138,7 +129,6 @@ class LeadIn(BaseModel):
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
     interest: str = Field(default="", max_length=255)
-    consent_whatsapp: bool = False
 class PlotIn(BaseModel):
     project: str = Field(min_length=2, max_length=160)
     plot_number: str = Field(min_length=1, max_length=40)
@@ -152,7 +142,7 @@ class ReferralIn(BaseModel):
     referred_phone: str = Field(min_length=7, max_length=30)
 class ReviewIn(BaseModel):
     customer_id: int
-    channel: str = Field(default="manual", pattern="^(manual|whatsapp|email)$")
+    channel: str = Field(default="manual", pattern="^(manual|email)$")
     consent_confirmed: bool
 
 def issue_token(user: User) -> str:
@@ -219,20 +209,23 @@ def growth(initial_value: float = Query(gt=0), annual_growth_percent: float = Qu
 def list_leads(db: Session = Depends(db_session), user: User = Depends(current_user)):
     query = select(Lead).order_by(Lead.created_at.desc())
     if user.role != Role.admin.value: query = query.where(Lead.owner_id == user.id)
-    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "consent_whatsapp": x.consent_whatsapp} for x in db.scalars(query)]
+    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
-def create_lead(data: LeadIn, background_tasks: BackgroundTasks, db: Session = Depends(db_session), user: User = Depends(current_user)):
-    normalized_phone = data.phone.strip()
-    if data.consent_whatsapp:
-        try: normalized_phone = normalize_phone(data.phone)
-        except ValueError: raise HTTPException(status_code=422, detail="For WhatsApp consent, enter the phone number with country code, e.g. 91XXXXXXXXXX")
-    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=normalized_phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), consent_whatsapp=data.consent_whatsapp)
+def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(current_user)):
+    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
+                email=str(data.email).lower() if data.email else None, interest=data.interest.strip())
     db.add(lead); db.commit(); db.refresh(lead)
-    if lead.consent_whatsapp:
-        save_whatsapp_consent(db, lead.phone, True, "lead_capture_checkbox", "Explicit WhatsApp consent recorded at lead creation")
-    background_tasks.add_task(send_lead_alert, lead.id)
-    return {"id": lead.id, "status": lead.status, "whatsapp_alert": "internal_alert_queued" if settings.whatsapp_alert_recipients else "not_configured", "customer_whatsapp_consent": lead.consent_whatsapp}
+    return {"id": lead.id, "status": lead.status}
+
+@app.get("/api/admin/lead-notifications")
+def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
+                       db: Session = Depends(db_session),
+                       user: User = Depends(require_roles(Role.admin))):
+    # New leads are durable notifications; changing lead status resolves the alert.
+    query = select(Lead).where(Lead.status == "new").order_by(Lead.created_at.desc(), Lead.id.desc()).limit(limit)
+    return [{"id": lead.id, "name": lead.name, "interest": lead.interest,
+             "created_at": lead.created_at.isoformat()} for lead in db.scalars(query)]
 
 @app.patch("/api/leads/{lead_id}/status")
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(current_user)):
@@ -405,196 +398,3 @@ def seed_business_settings():
         for key,value in DEFAULT_SETTINGS.items():
             if not db.scalar(select(AppSetting).where(AppSetting.key==key)): db.add(AppSetting(key=key,value=value))
         db.commit()
-
-
-# --- WhatsApp Cloud API integration: explicit consent, signed webhooks, audit trail ---
-class WhatsAppConsent(Base):
-    __tablename__ = "whatsapp_consents"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    phone: Mapped[str] = mapped_column(String(30), unique=True, index=True)
-    opted_in: Mapped[bool] = mapped_column(Boolean, default=False)
-    source: Mapped[str] = mapped_column(String(80), default="unknown")
-    evidence: Mapped[str] = mapped_column(String(500), default="")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-class WhatsAppWebhookEvent(Base):
-    __tablename__ = "whatsapp_webhook_events"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    provider_message_id: Mapped[str] = mapped_column(String(180), unique=True, index=True)
-    sender_phone: Mapped[str] = mapped_column(String(30), index=True)
-    message_type: Mapped[str] = mapped_column(String(40), default="unknown")
-    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-
-class WhatsAppDelivery(Base):
-    __tablename__ = "whatsapp_deliveries"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    recipient: Mapped[str] = mapped_column(String(30), index=True)
-    purpose: Mapped[str] = mapped_column(String(60))
-    provider_message_id: Mapped[str | None] = mapped_column(String(180), nullable=True)
-    status: Mapped[str] = mapped_column(String(30), default="queued")
-    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-
-Base.metadata.create_all(bind=engine)
-
-def normalize_phone(value: str) -> str:
-    cleaned = re.sub(r"[^0-9]", "", value or "")
-    if not 8 <= len(cleaned) <= 15:
-        raise ValueError("Phone must be in international format, including country code")
-    return cleaned
-
-def whatsapp_configured() -> bool:
-    return all([settings.whatsapp_access_token, settings.whatsapp_phone_number_id,
-                settings.whatsapp_app_secret, settings.whatsapp_graph_api_version,
-                re.fullmatch(r"v[0-9]+\.[0-9]+", settings.whatsapp_graph_api_version or "")])
-
-def save_whatsapp_consent(db: Session, phone: str, opted_in: bool, source: str, evidence: str):
-    normalized = normalize_phone(phone)
-    item = db.scalar(select(WhatsAppConsent).where(WhatsAppConsent.phone == normalized))
-    if item:
-        item.opted_in, item.source, item.evidence = opted_in, source[:80], evidence[:500]
-    else:
-        db.add(WhatsAppConsent(phone=normalized, opted_in=opted_in, source=source[:80], evidence=evidence[:500]))
-    db.commit()
-    return normalized
-
-async def send_whatsapp_template(recipient: str, template_name: str, language: str, body_parameters: list[str], purpose: str):
-    recipient = normalize_phone(recipient)
-    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id or not re.fullmatch(r"v[0-9]+\.[0-9]+", settings.whatsapp_graph_api_version or ""):
-        raise RuntimeError("WhatsApp Cloud API is not configured: set token, phone number ID and a supported Graph API version")
-    url = f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/{settings.whatsapp_phone_number_id}/messages"
-    payload = {"messaging_product":"whatsapp","recipient_type":"individual","to":recipient,"type":"template",
-               "template":{"name":template_name,"language":{"code":language},
-               "components":[{"type":"body","parameters":[{"type":"text","text":str(v)[:900]} for v in body_parameters]}]}}
-    delivery_id = None
-    with SessionLocal() as db:
-        delivery = WhatsAppDelivery(recipient=recipient,purpose=purpose,status="sending")
-        db.add(delivery); db.commit(); db.refresh(delivery); delivery_id = delivery.id
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(url, json=payload, headers={"Authorization":f"Bearer {settings.whatsapp_access_token}"})
-        data = response.json()
-        if response.is_error:
-            error = data.get("error", {})
-            raise RuntimeError(f"Meta API error {error.get('code','unknown')}: {error.get('message','request rejected')}")
-        provider_id = (data.get("messages") or [{}])[0].get("id")
-        with SessionLocal() as db:
-            row = db.get(WhatsAppDelivery, delivery_id)
-            row.status = "accepted" if provider_id else "unknown"
-            row.provider_message_id = provider_id
-            db.commit()
-        return {"status":"accepted" if provider_id else "unknown","message_id":provider_id}
-    except Exception as exc:
-        with SessionLocal() as db:
-            row = db.get(WhatsAppDelivery, delivery_id)
-            if row:
-                row.status="failed"; row.error_code=str(exc)[:80]; db.commit()
-        raise
-
-async def send_lead_alert(lead_id: int):
-    if not settings.whatsapp_alert_recipients.strip() or not settings.whatsapp_lead_alert_template.strip():
-        return
-    with SessionLocal() as db:
-        lead = db.get(Lead, lead_id)
-        if not lead: return
-        values = [lead.name, lead.phone, lead.interest or "Not specified", str(lead.id)]
-    for recipient in [x.strip() for x in settings.whatsapp_alert_recipients.split(",") if x.strip()]:
-        try:
-            await send_whatsapp_template(recipient, settings.whatsapp_lead_alert_template,
-                                         settings.whatsapp_template_language, values, "lead_alert")
-        except Exception:
-            # Delivery row records the failure; do not leak tokens or PII in logs.
-            continue
-
-@app.get("/api/whatsapp/webhook")
-async def whatsapp_webhook_verify(request: Request):
-    params = request.query_params
-    mode, token, challenge = params.get("hub.mode"), params.get("hub.verify_token"), params.get("hub.challenge")
-    if mode == "subscribe" and settings.whatsapp_verify_token and hmac.compare_digest(token or "", settings.whatsapp_verify_token):
-        return Response(content=challenge or "", media_type="text/plain")
-    raise HTTPException(status_code=403, detail="Webhook verification failed")
-
-@app.post("/api/whatsapp/webhook")
-async def whatsapp_webhook(request: Request):
-    if not settings.whatsapp_app_secret:
-        raise HTTPException(status_code=503, detail="Webhook signature validation is not configured")
-    raw = await request.body()
-    supplied = request.headers.get("X-Hub-Signature-256", "")
-    expected = "sha256=" + hmac.new(settings.whatsapp_app_secret.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    processed = 0
-    with SessionLocal() as db:
-        for entry in payload.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                for status_event in value.get("statuses", []):
-                    provider_id = status_event.get("id")
-                    state = status_event.get("status", "")
-                    if provider_id and state in {"sent","delivered","read","failed"}:
-                        delivery = db.scalar(select(WhatsAppDelivery).where(WhatsAppDelivery.provider_message_id == provider_id))
-                        if delivery:
-                            delivery.status = state
-                            errors = status_event.get("errors") or []
-                            if errors: delivery.error_code = str(errors[0].get("code", "provider_error"))[:80]
-                for message in value.get("messages", []):
-                    msg_id = message.get("id")
-                    sender = message.get("from", "")
-                    if not msg_id or not sender: continue
-                    if db.scalar(select(WhatsAppWebhookEvent).where(WhatsAppWebhookEvent.provider_message_id == msg_id)):
-                        continue
-                    text_body = (message.get("text") or {}).get("body", "").strip().lower()
-                    event = WhatsAppWebhookEvent(provider_message_id=msg_id, sender_phone=sender,
-                                                 message_type=message.get("type", "unknown"))
-                    db.add(event)
-                    if text_body in {"stop","stopall","unsubscribe","cancel","end","quit"}:
-                        try: save_whatsapp_consent(db, sender, False, "whatsapp_keyword", f"inbound keyword: {text_body}")
-                        except ValueError: pass
-                    elif text_body in {"start","unstop","subscribe"}:
-                        try: save_whatsapp_consent(db, sender, True, "whatsapp_keyword", f"inbound keyword: {text_body}")
-                        except ValueError: pass
-                    processed += 1
-        db.commit()
-    return {"status":"ok","processed_messages":processed}
-
-@app.get("/api/admin/whatsapp/status")
-def whatsapp_status(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
-    return {"configured":whatsapp_configured(),"verify_token_configured":bool(settings.whatsapp_verify_token),
-            "alert_recipients_configured":bool(settings.whatsapp_alert_recipients),
-            "template_configured":bool(settings.whatsapp_lead_alert_template),
-            "consent_records":db.scalar(select(__import__("sqlalchemy").func.count()).select_from(WhatsAppConsent)) or 0,
-            "failed_deliveries":db.scalar(select(__import__("sqlalchemy").func.count()).select_from(WhatsAppDelivery).where(WhatsAppDelivery.status=="failed")) or 0}
-
-@app.get("/api/admin/whatsapp/deliveries")
-def whatsapp_deliveries(limit:int=Query(default=50,ge=1,le=200), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    return [{"id":x.id,"recipient":x.recipient,"purpose":x.purpose,"status":x.status,
-             "provider_message_id":x.provider_message_id,"created_at":x.created_at.isoformat()}
-            for x in db.scalars(select(WhatsAppDelivery).order_by(WhatsAppDelivery.id.desc()).limit(limit))]
-
-@app.get("/api/admin/whatsapp/consents")
-def whatsapp_consents(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    return [{"phone":x.phone,"opted_in":x.opted_in,"source":x.source,"updated_at":x.updated_at.isoformat()}
-            for x in db.scalars(select(WhatsAppConsent).order_by(WhatsAppConsent.updated_at.desc()).limit(limit))]
-
-@app.post("/api/admin/whatsapp/consents")
-def admin_record_whatsapp_consent(phone:str, opted_in:bool, evidence:str=Query(min_length=5,max_length=500),
-                                  db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    try: normalized=save_whatsapp_consent(db,phone,opted_in,"admin_verified",evidence)
-    except ValueError as exc: raise HTTPException(status_code=422,detail=str(exc))
-    return {"phone":normalized,"opted_in":opted_in}
-
-@app.post("/api/admin/whatsapp/test")
-async def whatsapp_test(recipient:str, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    if not settings.whatsapp_lead_alert_template: raise HTTPException(status_code=503,detail="Set an approved lead alert template name first")
-    try:
-        result=await send_whatsapp_template(recipient,settings.whatsapp_lead_alert_template,
-                  settings.whatsapp_template_language,["Test lead","0000000000","Integration test","0"],"admin_test")
-        return result
-    except Exception as exc:
-        raise HTTPException(status_code=502,detail=str(exc)[:300])
-
-# Override the lead endpoint with the same route path? Instead wrap existing creation behavior by adding task at the endpoint definition above.
