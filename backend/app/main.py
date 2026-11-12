@@ -299,7 +299,8 @@ def list_leads(db: Session = Depends(db_session), user: User = Depends(require_r
     return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
-def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
+@limiter.limit("20/minute")
+def create_lead(data: LeadIn, request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
     if user.role == Role.customer.value and not data.consent:
         raise HTTPException(status_code=422, detail="Confirm contact consent before submitting")
     lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
