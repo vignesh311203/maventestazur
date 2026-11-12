@@ -539,6 +539,12 @@ class SupportMessageIn(BaseModel):
 
 def support_reply(body: str) -> str:
     text = body.casefold()
+    if text == "request brochure" or "brochure" in text:
+        return "Your brochure request has been saved. Please tell us which project interests you. Our property team can share verified project information and any available brochure here. In the meantime, explore the published plots on our website."
+    if text == "call me back" or "callback" in text or "call me back" in text:
+        return "Your callback request has been saved. Please share your preferred callback time and phone number in this private conversation if you agree to be contacted. Our property team will arrange the call; this is not an automated call or a confirmed appointment."
+    if text == "book site visit":
+        return "Your site-visit request has been saved. Please share the project, preferred date and time. A site visit is confirmed only after our property team responds. Transport arrangements, if available, will be confirmed separately."
     if any(word in text for word in ("book", "site visit", "visit", "appointment")):
         return "Thanks for your message. Our property team can help arrange a site visit. Please share your preferred project and date here. A visit is confirmed only after our team responds."
     if any(word in text for word in ("price", "cost", "emi", "budget", "loan", "rate")):
