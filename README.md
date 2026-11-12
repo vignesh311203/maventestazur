@@ -56,4 +56,4 @@ Remove obsolete WHATSAPP_* variables from your local .env and deployment secrets
 
 ## Tests
 
-Run `cd backend && python -m pytest -v`. Tests use isolated databases and test credentials, never the live database. For a browser check, use a dedicated disposable local Compose stack; install dependencies in frontend with npm install and npx playwright install chromium, then set TEST_ADMIN_EMAIL and TEST_ADMIN_PASSWORD to its dedicated administrator and run npm run test:e2e. The script creates test records, so never run against a real customer database. CI executes the complete test automatically.
+Run `cd backend`, `python -m pip install -r requirements-dev.txt`, and `python -m pytest -v`. Tests use isolated databases and test credentials, never the live database. For a browser check, use a dedicated disposable local Compose stack; install dependencies in frontend with npm install and npx playwright install chromium, then set TEST_ADMIN_EMAIL and TEST_ADMIN_PASSWORD to its dedicated administrator and run npm run test:e2e. The script creates test records, so never run against a real customer database. CI executes the complete test automatically.
