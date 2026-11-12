@@ -346,3 +346,29 @@ def test_support_reply_guidance_and_unavailable_account(client):
     assert client.patch(f"/api/admin/users/{customer_id}/active?active=false", headers=admin).status_code == 200
     assert client.get("/api/customer/messages", headers=customer).status_code == 401
     assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=payload).status_code == 409
+
+
+def test_support_quick_actions(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "quick-actions@example.com")
+    other = register(client, "quick-other@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    actions = [
+        ("Book Site Visit", "confirmed only"),
+        ("Request Brochure", "verified project information"),
+        ("Call Me Back", "not an automated call"),
+    ]
+    for index, (body, expected) in enumerate(actions):
+        payload = {"body": body, "client_id": f"quick-action-test-{index:03d}"}
+        response = client.post("/api/customer/messages", headers=customer, json=payload)
+        assert response.status_code == 201, response.text
+        assert client.post("/api/customer/messages", headers=customer, json=payload).json()["id"] == response.json()["id"]
+        history = client.get("/api/customer/messages", headers=customer).json()
+        assert history[-2]["body"] == body
+        assert history[-1]["sender"] == "assistant"
+        assert expected in history[-1]["body"]
+        assert client.get("/api/admin/messages", headers=admin).json()[0]["last_message"] == body
+    assert len(client.get("/api/customer/messages", headers=customer).json()) == 6
+    assert client.get("/api/customer/messages", headers=other).json() == []
+    assert client.get(f"/api/admin/messages/{customer_id}", headers=other).status_code == 403
+    assert client.get(f"/api/admin/messages/{customer_id}", headers=admin).json() == history
