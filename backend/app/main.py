@@ -2,14 +2,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Generator
+from math import expm1, log1p
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -19,15 +23,29 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_secret_key: str = "replace-me"
     database_url: str = "sqlite:///./dev.db"
-    access_token_minutes: int = 30
+    access_token_minutes: int = Field(default=30, ge=1, le=120)
     cors_origins: str = "http://localhost:5173"
+    redis_url: str = ""
+    trusted_hosts: str = "localhost,127.0.0.1,testserver"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
-if settings.app_env == "production" and len(settings.app_secret_key) < 32:
-    raise RuntimeError("APP_SECRET_KEY must be at least 32 characters in production")
+if settings.app_env == "production":
+    if len(settings.app_secret_key) < 32 or settings.app_secret_key.startswith("replace-"):
+        raise RuntimeError("Set a unique, random APP_SECRET_KEY for production")
+    if not settings.database_url.startswith("postgresql"):
+        raise RuntimeError("Production requires PostgreSQL")
+    db_password = make_url(settings.database_url).password or ""
+    if len(db_password) < 24 or db_password.startswith(("replace-", "change-")):
+        raise RuntimeError("Set a unique, URL-safe production database password")
+    if not settings.redis_url:
+        raise RuntimeError("Production requires Redis-backed rate limiting")
+    if not settings.trusted_hosts or "*" in settings.trusted_hosts:
+        raise RuntimeError("Production requires explicit TRUSTED_HOSTS")
+    if settings.bootstrap_admin_password and (len(settings.bootstrap_admin_password) < 16 or settings.bootstrap_admin_password.startswith("change-")):
+        raise RuntimeError("Set a strong, unique bootstrap administrator password")
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -91,12 +109,13 @@ class ReviewRequest(Base):
     consent_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-Base.metadata.create_all(bind=engine)
 password_hash = PasswordHash.recommended()
 bearer = HTTPBearer(auto_error=False)
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None)
+limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
+app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
 app.state.limiter = limiter
+if settings.app_env == "production":
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in settings.trusted_hosts.split(",") if host.strip()])
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
 
@@ -104,6 +123,8 @@ app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.co
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -124,11 +145,25 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
+def clean_name(value: str) -> str:
+    value = value.strip()
+    if len(value) < 2 or any(ord(ch) < 32 for ch in value):
+        raise ValueError("Name must contain at least two visible characters")
+    return value
+
+def clean_phone(value: str) -> str:
+    value = value.strip()
+    if any(ch not in "0123456789+ ()-" for ch in value) or not 7 <= sum(ch.isdigit() for ch in value) <= 15:
+        raise ValueError("Enter a valid phone number with 7 to 15 digits")
+    return value
+
 class LeadIn(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
     interest: str = Field(default="", max_length=255)
+    _validate_name = field_validator("name")(clean_name)
+    _validate_phone = field_validator("phone")(clean_phone)
 class PlotIn(BaseModel):
     project: str = Field(min_length=2, max_length=160)
     plot_number: str = Field(min_length=1, max_length=40)
@@ -140,8 +175,10 @@ class PlotIn(BaseModel):
 class ReferralIn(BaseModel):
     referred_name: str = Field(min_length=2, max_length=160)
     referred_phone: str = Field(min_length=7, max_length=30)
+    _validate_name = field_validator("referred_name")(clean_name)
+    _validate_phone = field_validator("referred_phone")(clean_phone)
 class ReviewIn(BaseModel):
-    customer_id: int
+    customer_id: int = Field(gt=0)
     channel: str = Field(default="manual", pattern="^(manual|email)$")
     consent_confirmed: bool
 
@@ -152,7 +189,7 @@ def issue_token(user: User) -> str:
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(db_session)) -> User:
     if not credentials: raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        payload = jwt.decode(credentials.credentials, settings.app_secret_key, algorithms=["HS256"])
+        payload = jwt.decode(credentials.credentials, settings.app_secret_key, algorithms=["HS256"], options={"require": ["sub", "iat", "exp"]})
         user_id = int(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -169,12 +206,25 @@ def require_roles(*roles: Role):
 @app.get("/health")
 def health(): return {"status": "ok", "environment": settings.app_env}
 
+@app.get("/ready")
+def ready(db: Session = Depends(db_session)):
+    try:
+        db.execute(select(User.id).limit(1))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "ready"}
+
 @app.post("/api/auth/register", status_code=201)
 @limiter.limit("5/minute")
 def register(data: RegisterIn, request: Request, db: Session = Depends(db_session)):
     if db.scalar(select(User).where(User.email == data.email.lower())): raise HTTPException(status_code=409, detail="Email already registered")
     user = User(email=data.email.lower(), full_name=data.full_name.strip(), password_hash=password_hash.hash(data.password), role=Role.customer.value)
-    db.add(user); db.commit(); db.refresh(user)
+    db.add(user)
+    try: db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered")
+    db.refresh(user)
     return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}}
 
 @app.post("/api/auth/login")
@@ -188,20 +238,20 @@ def login(data: LoginIn, request: Request, db: Session = Depends(db_session)):
 def me(user: User = Depends(current_user)): return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}
 
 @app.post("/api/calculators/emi")
-def emi(principal: float = Query(gt=0), annual_rate_percent: float = Query(ge=0), months: int = Query(gt=0, le=600)):
+def emi(principal: float = Query(gt=0, le=1e12), annual_rate_percent: float = Query(ge=0, le=100), months: int = Query(gt=0, le=600)):
     r = annual_rate_percent / 1200
-    payment = principal / months if r == 0 else principal * r * (1 + r) ** months / ((1 + r) ** months - 1)
+    payment = principal / months if r == 0 else principal * r / (-expm1(-months * log1p(r)))
     return {"monthly_emi": round(payment, 2), "total_payment": round(payment * months, 2), "total_interest": round(payment * months - principal, 2)}
 
 @app.post("/api/calculators/plot-cost")
-def plot_cost(area_sqft: float = Query(gt=0), rate_per_sqft: float = Query(gt=0), registration_percent: float = Query(ge=0, le=100), stamp_duty_percent: float = Query(ge=0, le=100), other_charges: float = Query(ge=0)):
+def plot_cost(area_sqft: float = Query(gt=0, le=1e6), rate_per_sqft: float = Query(gt=0, le=1e6), registration_percent: float = Query(ge=0, le=100), stamp_duty_percent: float = Query(ge=0, le=100), other_charges: float = Query(ge=0, le=1e9)):
     base = area_sqft * rate_per_sqft
     reg = base * registration_percent / 100
     stamp = base * stamp_duty_percent / 100
     return {"base_cost": round(base, 2), "registration": round(reg, 2), "stamp_duty": round(stamp, 2), "other_charges": round(other_charges, 2), "total": round(base + reg + stamp + other_charges, 2)}
 
 @app.post("/api/calculators/growth")
-def growth(initial_value: float = Query(gt=0), annual_growth_percent: float = Query(ge=-99, le=100), years: int = Query(gt=0, le=100)):
+def growth(initial_value: float = Query(gt=0, le=1e12), annual_growth_percent: float = Query(ge=-99, le=100), years: int = Query(gt=0, le=100)):
     future = initial_value * (1 + annual_growth_percent / 100) ** years
     return {"future_value": round(future, 2), "gain": round(future - initial_value, 2)}
 
@@ -232,6 +282,7 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
     lead = db.get(Lead, lead_id)
     if not lead or (user.role != Role.admin.value and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
+    if user.role not in {Role.admin.value, Role.agent.value}: raise HTTPException(status_code=403, detail="Only sales staff can change lead status")
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
@@ -260,7 +311,9 @@ def list_referrals(db: Session = Depends(db_session), user: User = Depends(curre
 def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.agent))):
     if not data.consent_confirmed: raise HTTPException(status_code=400, detail="Explicit customer consent is required before review outreach")
     customer = db.get(User, data.customer_id)
-    if not customer: raise HTTPException(status_code=404, detail="Customer not found")
+    if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
+    if user.role == Role.agent.value and not db.scalar(select(Lead.id).where(Lead.owner_id == user.id, Lead.email == customer.email).limit(1)):
+        raise HTTPException(status_code=404, detail="Customer not found in your assigned leads")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
     db.add(item); db.commit(); db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
@@ -296,7 +349,6 @@ class AdminAudit(Base):
     target: Mapped[str] = mapped_column(String(160), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-Base.metadata.create_all(bind=engine)
 DEFAULT_SETTINGS = {"registration_percent":"5.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
 
 class AdminUserIn(BaseModel):
@@ -354,7 +406,12 @@ def admin_create_user(data: AdminUserIn, db: Session = Depends(db_session), user
     email=data.email.lower()
     if db.scalar(select(User).where(User.email==email)): raise HTTPException(status_code=409,detail="Email already registered")
     created=User(email=email,full_name=data.full_name.strip(),password_hash=password_hash.hash(data.password),role=data.role.value)
-    db.add(created); db.commit(); db.refresh(created)
+    db.add(created)
+    try: db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered")
+    db.refresh(created)
     write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}")
     return {"id":created.id,"email":created.email,"full_name":created.full_name,"role":created.role,"is_active":created.is_active}
 

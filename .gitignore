@@ -11,3 +11,5 @@ dist/
 .coverage
 *.db
 .DS_Store
+!.env.production.example
+backups/
