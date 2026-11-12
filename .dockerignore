@@ -1,0 +1,11 @@
+**/.env
+**/.env.*
+**/.git
+**/node_modules
+**/dist
+**/__pycache__
+**/.venv
+**/*.db
+**/*.sqlite
+**/*.pem
+**/*.key
