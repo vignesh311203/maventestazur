@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Generator
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
@@ -188,20 +188,20 @@ def login(data: LoginIn, request: Request, db: Session = Depends(db_session)):
 def me(user: User = Depends(current_user)): return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}
 
 @app.post("/api/calculators/emi")
-def emi(principal: float = Field(gt=0), annual_rate_percent: float = Field(ge=0), months: int = Field(gt=0, le=600)):
+def emi(principal: float = Query(gt=0), annual_rate_percent: float = Query(ge=0), months: int = Query(gt=0, le=600)):
     r = annual_rate_percent / 1200
     payment = principal / months if r == 0 else principal * r * (1 + r) ** months / ((1 + r) ** months - 1)
     return {"monthly_emi": round(payment, 2), "total_payment": round(payment * months, 2), "total_interest": round(payment * months - principal, 2)}
 
 @app.post("/api/calculators/plot-cost")
-def plot_cost(area_sqft: float = Field(gt=0), rate_per_sqft: float = Field(gt=0), registration_percent: float = Field(ge=0, le=100), stamp_duty_percent: float = Field(ge=0, le=100), other_charges: float = Field(ge=0)):
+def plot_cost(area_sqft: float = Query(gt=0), rate_per_sqft: float = Query(gt=0), registration_percent: float = Query(ge=0, le=100), stamp_duty_percent: float = Query(ge=0, le=100), other_charges: float = Query(ge=0)):
     base = area_sqft * rate_per_sqft
     reg = base * registration_percent / 100
     stamp = base * stamp_duty_percent / 100
     return {"base_cost": round(base, 2), "registration": round(reg, 2), "stamp_duty": round(stamp, 2), "other_charges": round(other_charges, 2), "total": round(base + reg + stamp + other_charges, 2)}
 
 @app.post("/api/calculators/growth")
-def growth(initial_value: float = Field(gt=0), annual_growth_percent: float = Field(ge=-99, le=100), years: int = Field(gt=0, le=100)):
+def growth(initial_value: float = Query(gt=0), annual_growth_percent: float = Query(ge=-99, le=100), years: int = Query(gt=0, le=100)):
     future = initial_value * (1 + annual_growth_percent / 100) ** years
     return {"future_value": round(future, 2), "gain": round(future - initial_value, 2)}
 
