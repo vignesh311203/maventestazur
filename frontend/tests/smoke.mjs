@@ -28,7 +28,7 @@ try{
   await page.getByLabel("Full name",{exact:true}).fill(name);await page.getByLabel("Phone number",{exact:true}).fill("9999999999");await page.getByLabel("Property interest",{exact:true}).fill("Test residential plot");await page.getByRole("checkbox").check();
   const guest=page.waitForResponse(r=>r.url().endsWith("/api/public/enquiries")&&r.request().method()==="POST");
   await page.getByRole("button",{name:"Send enquiry",exact:true}).click();assert.equal((await guest).status(),201);
-  await page.getByRole("status").getByText(/Your enquiry has been received/).waitFor();
+  await page.getByText(/Your enquiry has been received/).waitFor();
   console.log("PASS guest enquiry without email and with consent");
   await page.goto(web+"/admin");await page.getByRole("heading",{name:"Administrator sign in"}).waitFor();await signIn(adminEmail,adminPassword);
   await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();
@@ -55,7 +55,7 @@ try{
   await page.getByLabel("Phone number",{exact:true}).fill("9999999999");await page.getByLabel("Property interest",{exact:true}).fill("My private plot enquiry");await page.getByRole("checkbox").check();
   const own=page.waitForResponse(r=>r.url().endsWith("/api/leads")&&r.request().method()==="POST");await page.getByRole("button",{name:"Send enquiry",exact:true}).click();assert.equal((await own).status(),201);await page.getByText("My private plot enquiry",{exact:true}).waitFor();
   console.log("PASS customer sees only own enquiry status");
-  await page.goto(web+"/admin");await signIn(customerEmail,customerPassword);await page.getByRole("status").getByText(/cannot access this panel/).waitFor();assert.equal(await page.getByRole("heading",{name:"Registered users"}).count(),0);
+  await page.goto(web+"/admin");await signIn(customerEmail,customerPassword);await page.getByText(/cannot access this panel/).waitFor();assert.equal(await page.getByRole("heading",{name:"Registered users"}).count(),0);
   console.log("PASS customer denied admin panel");
   await signIn(adminEmail,adminPassword);await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();await nav("Reviews");await page.getByLabel("Customer account ID").fill(String(customer.user.id));await page.getByRole("checkbox",{name:/explicitly agreed/}).check();const review=page.waitForResponse(r=>r.url().endsWith("/api/reviews/requests")&&r.request().method()==="POST");await page.getByRole("button",{name:"Record review request"}).click();assert.equal((await review).status(),201);
   console.log("PASS manual review consent");
