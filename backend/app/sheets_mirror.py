@@ -97,7 +97,7 @@ class SheetsMirror:
             rows = max(grid.get("rowCount", 0), len(snapshot[tab]) + 1, 100)
             cols = max(grid.get("columnCount", 0), len(headers))
             if rows != grid.get("rowCount") or cols != grid.get("columnCount"):
-                resize.append({"updateSheetProperties": {"properties": {"sheetId": prop["sheetId"], "gridProperties": {"rowCount": rows, "columnCount": cols}}, "fields": "gridProperties(rowCount,columnCount)"}})
+                resize.append({"updateSheetProperties": {"properties": {"sheetId": prop["sheetId"], "gridProperties": {"rowCount": rows, "columnCount": cols}}, "fields": "gridProperties.rowCount,gridProperties.columnCount"}})
         if resize:
             self._call("POST", ":batchUpdate", json={"requests": resize})
             meta = self.metadata()

@@ -512,6 +512,10 @@ def admin_list_referrals(db:Session=Depends(db_session), user:User=Depends(requi
 def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     item=db.get(Referral,referral_id)
     if not item: raise HTTPException(status_code=404,detail="Referral not found")
+    if item.status == "paid" and (data.status != "paid" or data.reward_amount != item.reward_amount):
+        raise HTTPException(status_code=409, detail="Paid reward records cannot be changed")
+    if data.status == "paid" and (item.status not in {"approved", "paid"} or data.reward_amount != item.reward_amount):
+        raise HTTPException(status_code=409, detail="Approve the reward before recording its verified payment")
     item.status=data.status; item.reward_amount=data.reward_amount; db.commit()
     write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}")
     return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
