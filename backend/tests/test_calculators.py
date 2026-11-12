@@ -222,7 +222,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0002_contact_consent"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0003_support_messages"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -289,3 +289,60 @@ def test_validation_does_not_echo_password(client):
     assert response.status_code == 422
     assert "secret" not in response.text
     assert all("input" not in error for error in response.json()["detail"])
+
+
+def test_private_support_message_lifecycle(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "chat-customer@example.com")
+    other = register(client, "other-chat@example.com")
+    _, partner = make_user(client, admin, "chat-partner@example.com", "partner")
+    _, agent = make_user(client, admin, "chat-agent@example.com", "agent")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    payload = {"body": "What is the plot price?", "client_id": "test-client-message-001"}
+    assert client.get("/api/customer/messages").status_code == 401
+    assert client.post("/api/customer/messages", json=payload).status_code == 401
+    assert client.get("/api/customer/messages", headers=customer).json() == []
+    first = client.post("/api/customer/messages", headers=customer, json=payload)
+    assert first.status_code == 201, first.text
+    duplicate = client.post("/api/customer/messages", headers=customer, json=payload)
+    assert duplicate.status_code == 201
+    assert duplicate.json()["id"] == first.json()["id"]
+    assert client.post("/api/customer/messages", headers=customer, json=payload | {"body": "Changed"}).status_code == 409
+    messages = client.get("/api/customer/messages", headers=customer).json()
+    assert [m["sender"] for m in messages] == ["customer", "assistant"]
+    assert "calculators" in messages[1]["body"]
+    assert client.get("/api/customer/messages", headers=other).json() == []
+    for headers in (customer, other, partner, agent):
+        assert client.get("/api/admin/messages", headers=headers).status_code == 403
+        assert client.get(f"/api/admin/messages/{customer_id}", headers=headers).status_code == 403
+        assert client.post(f"/api/admin/messages/{customer_id}", headers=headers, json=payload).status_code == 403
+    assert client.get("/api/customer/messages", headers=partner).status_code == 403
+    assert client.get("/api/customer/messages", headers=admin).status_code == 403
+    assert client.get("/api/admin/messages", headers=admin).json()[0]["awaiting_reply"] is True
+    assert client.get(f"/api/admin/messages/{customer_id}", headers=admin).json() == messages
+    reply = {"body": "Please share your preferred project.", "client_id": "test-admin-message-001"}
+    assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=reply).status_code == 201
+    history = client.get("/api/customer/messages", headers=customer)
+    assert history.headers["cache-control"] == "no-store"
+    assert [m["sender"] for m in history.json()] == ["customer", "assistant", "admin"]
+    assert history.json()[-1]["body"] == reply["body"]
+    assert client.get("/api/admin/messages", headers=admin).json()[0]["awaiting_reply"] is False
+    page = client.get("/api/customer/messages?limit=1", headers=customer).json()
+    assert len(page) == 1
+    older = client.get(f"/api/customer/messages?before_id={page[0]['id']}&limit=2", headers=customer).json()
+    assert len(older) == 2
+    for body in (" ", "x" * 2001):
+        assert client.post("/api/customer/messages", headers=customer, json={"body": body, "client_id": "test-invalid-message-001"}).status_code == 422
+
+
+def test_support_reply_guidance_and_unavailable_account(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "chat-visit@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    assert client.get(f"/api/admin/messages/{customer_id}", headers=admin).status_code == 404
+    payload = {"body": "Can I book a site visit?", "client_id": "test-visit-message-001"}
+    assert client.post("/api/customer/messages", headers=customer, json=payload).status_code == 201
+    assert "confirmed only" in client.get("/api/customer/messages", headers=customer).json()[-1]["body"]
+    assert client.patch(f"/api/admin/users/{customer_id}/active?active=false", headers=admin).status_code == 200
+    assert client.get("/api/customer/messages", headers=customer).status_code == 401
+    assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=payload).status_code == 409
