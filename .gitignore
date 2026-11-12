@@ -13,3 +13,7 @@ dist/
 .DS_Store
 !.env.production.example
 backups/
+credentials.json
+google-service-account*.json
+service-account*.json
+metroestate-private-report*.zip

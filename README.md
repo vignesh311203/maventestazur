@@ -81,3 +81,20 @@ Messaging is in-website only; it does not send SMS, WhatsApp or email notificati
 ### Quick property requests
 
 The customer chat includes Book Site Visit, Request Brochure and Call Me Back buttons. Each sends a private, persisted chat request and receives immediate guidance. Administrators see the requests in Messages and can reply. These actions do not automatically book a visit, arrange transport, initiate a call or deliver an unverified brochure. Callback contact details are shared voluntarily in the private chat. No external credentials are needed.
+
+
+## Stateful customer support and Google Sheets reporting
+
+The assistant now persists its conversation state in PostgreSQL. It collects project, preferred date/time, phone number and explicit permission where relevant, handles price questions during a request, supports cancellation and handoff, and saves completed site-visit, brochure and callback requests as new leads. It remains automated, and does not book, call, send a file or promise a visit. Contact details are optional for chat-only follow-up. Preferred time is recorded as requested, not a confirmed appointment. Migration 0004_chat_state adds state and structured lead fields, and 0005_sheets_outbox adds durable reporting change markers and sync status.
+
+Administrators can edit plot inventory from Layout, see request type/source/preferred time in Leads, see new enquiries refresh in the Admin panel, and record an already verified referral payment (no payment transfer). The Sheets tab shows synchronization status and provides a ZIP of six private CSV reports even when Google is not configured.
+
+To enable one-way Google Sheets reporting:
+
+1. Create a dedicated blank Google spreadsheet and keep sharing Restricted. Use only approved administrators; avoid public link sharing. No password hashes, tokens or provider credentials are exported.
+2. Enable Google Sheets API in a Google Cloud project. Create a dedicated service account; share only this spreadsheet with its email as Editor. Do not grant broad Drive access or domain-wide delegation. See https://developers.google.com/workspace/guides/create-credentials.
+3. Create an authorized JSON service-account key. Store it privately in Railway service Variables as GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON or base64). Never commit the key or paste it into chat. Set GOOGLE_SHEET_ID to the spreadsheet ID, and GOOGLE_SHEETS_ENABLED=true. Restart/redeploy the application. Google Drive connection in ChatGPT does not confer server credentials.
+4. Open Admin > Sheets. Check Last successful sync and pending changes. The first sync exports existing records; subsequent changes are queued transactionally and retried with backoff. The six tabs are Leads, Messages, Plots, Referrals, Partners and Customers. Dedicated tab ranges are rewritten from the database; do not use them as the source of truth or add manual data within managed columns. An hourly reconciliation handles missed/manual edits. The worker acquires a PostgreSQL advisory lock to avoid concurrent writers. A failed sync leaves change markers and the database untouched.
+5. If the integration is unavailable, download private CSV reports from the Sheets panel and import them into a separate restricted spreadsheet. Protect copies and implement deletion/retention procedures. The sync is optional and disabled by default; the main website does not depend on it.
+
+The Sheets mirror contains personal data and private chat content. Confirm organizational authorization and privacy disclosure before enabling it; revoke service account access when retiring the integration. Google Sheets is not a database backup; maintain tested PostgreSQL backups. Unit tests use simulated Google API responses, not a production Google account. Live Sheets synchronization is only verified when credentials and the designated document have been configured and the first successful sync is observed. Large datasets may exceed Sheets quotas/capacity; PostgreSQL retains the full records.

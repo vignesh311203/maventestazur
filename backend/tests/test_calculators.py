@@ -11,6 +11,7 @@ _test_dir = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = "sqlite:///" + _test_dir.name + "/import.db"
 os.environ["APP_ENV"] = "development"
 os.environ["REDIS_URL"] = ""
+os.environ["GOOGLE_SHEETS_ENABLED"] = "false"
 os.environ["APP_SECRET_KEY"] = "test-only-secret-not-used-in-production-123456789"
 os.environ["BOOTSTRAP_ADMIN_EMAIL"] = ""
 os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = ""
@@ -222,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0003_support_messages"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_sheets_outbox"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -348,27 +349,176 @@ def test_support_reply_guidance_and_unavailable_account(client):
     assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=payload).status_code == 409
 
 
+
 def test_support_quick_actions(client):
     admin = login(client, "admin@example.com", "TestAdminPass123!")
     customer = register(client, "quick-actions@example.com")
     other = register(client, "quick-other@example.com")
     customer_id = client.get("/api/me", headers=customer).json()["id"]
-    actions = [
-        ("Book Site Visit", "confirmed only"),
-        ("Request Brochure", "verified project information"),
-        ("Call Me Back", "not an automated call"),
+    steps = [
+        ("Book Site Visit", "Which project"),
+        ("Test Enclave", "When would suit"),
+        ("What is the plot price?", "Back to your request"),
+        ("Saturday 11 am", "best phone number"),
+        ("+91 99999 99999", "May our property team"),
+        ("Yes, contact me", "site-visit request has been saved"),
+        ("Request Brochure", "Which project"),
+        ("Not sure yet", "brochure request has been saved"),
+        ("Call Me Back", "When would suit"),
+        ("Tomorrow evening", "best phone number"),
+        ("Chat only", "callback request has been saved"),
     ]
-    for index, (body, expected) in enumerate(actions):
+    for index, (body, expected) in enumerate(steps):
         payload = {"body": body, "client_id": f"quick-action-test-{index:03d}"}
         response = client.post("/api/customer/messages", headers=customer, json=payload)
         assert response.status_code == 201, response.text
-        assert client.post("/api/customer/messages", headers=customer, json=payload).json()["id"] == response.json()["id"]
+        # Retry the exact same final message to prove no duplicate business request.
+        if index == 5:
+            assert client.post("/api/customer/messages", headers=customer, json=payload).json()["id"] == response.json()["id"]
         history = client.get("/api/customer/messages", headers=customer).json()
         assert history[-2]["body"] == body
-        assert history[-1]["sender"] == "assistant"
-        assert expected in history[-1]["body"]
-        assert client.get("/api/admin/messages", headers=admin).json()[0]["last_message"] == body
-    assert len(client.get("/api/customer/messages", headers=customer).json()) == 6
+        assert expected in history[-1]["body"], history[-1]
+    assert len(history) == 22
+    assert client.get("/api/customer/chat-state", headers=customer).json()["in_progress"] is False
     assert client.get("/api/customer/messages", headers=other).json() == []
+    assert client.get("/api/customer/chat-state", headers=other).json()["in_progress"] is False
     assert client.get(f"/api/admin/messages/{customer_id}", headers=other).status_code == 403
     assert client.get(f"/api/admin/messages/{customer_id}", headers=admin).json() == history
+    leads = client.get("/api/leads", headers=admin).json()
+    assert {x["request_type"] for x in leads} == {"site_visit", "callback", "brochure"}
+    assert len(leads) == 3
+    visit = next(x for x in leads if x["request_type"] == "site_visit")
+    assert visit["source"] == "chat" and visit["preferred_time"] == "Saturday 11 am"
+    assert visit["contact_consent_at"] and visit["phone"] == "+91 99999 99999"
+    callback = next(x for x in leads if x["request_type"] == "callback")
+    assert callback["phone"] == "" and callback["contact_consent_at"] is None
+    assert len(client.get("/api/admin/lead-notifications", headers=admin).json()) == 3
+    assert len(client.get("/api/customer/enquiries", headers=customer).json()) == 3
+
+
+def test_conversation_interruptions_and_cancellation():
+    from app.chatbot import respond, phone_from
+    first = respond("Hi, I want to book a site visit", "Test Customer", projects=["Known Project"])
+    assert first.state["flow"] == "site_visit"
+    price = respond("What is the price?", "Test Customer", first.state)
+    assert price.state == first.state and "Back to your request" in price.text
+    greeting = respond("hello", "Test Customer", price.state)
+    assert greeting.state == first.state
+    project = respond("Known Project", "Test Customer", greeting.state, ["Known Project"])
+    assert project.state["slots"]["project"] == "Known Project"
+    human = respond("Can I speak to a real person?", "Test Customer", project.state)
+    assert human.state == project.state and human.lead is None
+    cancelled = respond("cancel", "Test Customer", human.state)
+    assert cancelled.state == {} and cancelled.lead is None
+    assert phone_from("2026-11-12") is None
+    assert phone_from("My date is 12/12/2026") is None
+    assert phone_from("+91 98765 43210") == "+91 98765 43210"
+
+
+def test_sheet_reporting_privacy_queue_and_retry(client, monkeypatch):
+    import io, zipfile
+    from pydantic import SecretStr
+    from sqlalchemy import select, func
+    from app.sheet_sync import process_once, snapshot
+    from app.sheets_mirror import TABS, SheetsError
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "sheetcustomer@example.com")
+    other = register(client, "sheetother@example.com")
+    assert client.get("/api/admin/sheets/status").status_code == 401
+    for endpoint in ("status", "export"):
+        assert client.get("/api/admin/sheets/" + endpoint, headers=customer).status_code == 403
+    assert client.post("/api/admin/sheets/sync", headers=other).status_code == 403
+    assert client.get("/api/admin/sheets/status", headers=admin).json()["configured"] is False
+    assert client.post("/api/admin/sheets/sync", headers=admin).status_code == 409
+    assert client.post("/api/customer/messages", headers=customer, json={"body": "=1+1", "client_id": "sheet-message-test-001"}).status_code == 201
+    assert client.post("/api/plots", headers=admin, json={"project":"Reporting Test","plot_number":"P1","area_sqft":1200,"rate_per_sqft":3500}).status_code == 201
+    _, partner = make_user(client, admin, "sheetpartner@example.com", "partner")
+    ref = client.post("/api/partners/referrals", headers=partner, json={"referred_name":"Sheet Referral","referred_phone":"9999999999"})
+    assert ref.status_code == 201
+    rid = ref.json()["id"]
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=admin, json={"status":"paid","reward_amount":1000}).status_code == 409
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=admin, json={"status":"approved","reward_amount":1000}).status_code == 200
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=admin, json={"status":"paid","reward_amount":1000}).status_code == 200
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=admin, json={"status":"rejected","reward_amount":0}).status_code == 409
+    response = client.get("/api/admin/sheets/export", headers=admin)
+    assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {name + ".csv" for name in TABS}
+        assert "'=1+1" in archive.read("Messages.csv").decode("utf-8-sig")
+        assert "password_hash" not in archive.read("Customers.csv").decode("utf-8-sig")
+        assert "sheetcustomer@example.com" in archive.read("Customers.csv").decode("utf-8-sig")
+    with m.SessionLocal() as db:
+        data = snapshot(db)
+        assert data["Partners"][0]["rewards_paid"] == 1000
+        assert data["Plots"][0]["total_price"] == 4200000
+        pending = db.scalar(select(func.count(m.SheetOutbox.id)))
+        assert pending > 0
+        db.add(m.Plot(project="Rollback Test", plot_number="R1", area_sqft=100, rate_per_sqft=100))
+        db.flush()
+        db.rollback()
+        assert db.scalar(select(func.count(m.SheetOutbox.id))) == pending
+    monkeypatch.setattr(m.settings, "google_sheets_enabled", True)
+    monkeypatch.setattr(m.settings, "google_sheet_id", "test-spreadsheet-id")
+    monkeypatch.setattr(m.settings, "google_service_account_json", SecretStr("mock-only"))
+    class FailedMirror:
+        def __init__(self, *args): pass
+        def sync(self, data): raise SheetsError("Google Sheets HTTP 503")
+        def close(self): pass
+    assert process_once(m, FailedMirror) == "failed"
+    assert client.get("/api/admin/sheets/status", headers=admin).json()["pending_changes"] == pending
+    assert client.get("/api/admin/sheets/status", headers=admin).json()["last_error"] == "Google Sheets HTTP 503"
+    class GoodMirror:
+        def __init__(self, *args): pass
+        def sync(self, data):
+            assert set(data) == set(TABS)
+            assert data["Messages"][0]["body"] == "=1+1"
+            assert len(data["Customers"]) == 2
+        def close(self): pass
+    assert process_once(m, GoodMirror) == "synced"
+    status = client.get("/api/admin/sheets/status", headers=admin).json()
+    assert status["pending_changes"] == 0 and status["last_success"] and not status["last_error"]
+    assert process_once(m, GoodMirror) == "idle"
+    assert client.post("/api/admin/sheets/sync", headers=admin).status_code == 202
+
+
+def test_sheets_mirror_uses_raw_deterministic_ranges():
+    from urllib.parse import unquote
+    from app.sheets_mirror import SheetsMirror, TABS, SheetsError
+    class Resp:
+        status_code = 200
+        content = b"{}"
+        def __init__(self, data): self.data = data
+        def json(self): return self.data
+    class FakeSession:
+        def __init__(self):
+            self.writes = []
+            self.headers = {}
+            self.props = {t: {"sheetId": i, "title": t, "gridProperties": {"rowCount":100, "columnCount":len(h)}} for i,(t,h) in enumerate(TABS.items(),1)}
+        def request(self, method, url, timeout, **kwargs):
+            path = unquote(url)
+            if "fields" in kwargs.get("params", {}):
+                return Resp({"sheets":[{"properties":p} for p in self.props.values()]})
+            if method == "GET":
+                tab = path.split("'")[1]
+                return Resp({"values": [self.headers[tab]]} if tab in self.headers else {})
+            self.writes.append((method, path, kwargs))
+            if method == "PUT":
+                tab = path.split("'")[1]
+                self.headers[tab] = kwargs["json"]["values"][0]
+            return Resp({})
+        def close(self): pass
+    data = {name: [] for name in TABS}
+    data["Messages"] = [{"id":1,"body":"=1+1"}]
+    fake = FakeSession()
+    mirror = SheetsMirror("mock-sheet-12345", session=fake)
+    mirror.sync(data)
+    first = list(fake.writes)
+    mirror.sync(data)
+    assert fake.writes[len(first):] == first
+    assert all(":append" not in call[1] for call in first)
+    messages = next(call for call in first if call[0] == "PUT" and "'Messages'" in call[1])
+    assert messages[2]["params"]["valueInputOption"] == "RAW"
+    assert messages[2]["json"]["values"][1][-1] == "=1+1"
+    fake.headers["Leads"] = ["Unexpected header"]
+    with pytest.raises(SheetsError, match="Unexpected header"):
+        mirror.sync(data)
