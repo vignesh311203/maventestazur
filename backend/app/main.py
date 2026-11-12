@@ -4,6 +4,8 @@ from enum import Enum
 from typing import Generator
 from math import expm1, log1p
 import jwt
+import hashlib
+import hmac
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -142,6 +144,10 @@ class RegisterIn(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=2, max_length=160)
     password: str = Field(min_length=12, max_length=128)
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
@@ -164,6 +170,10 @@ class LeadIn(BaseModel):
     interest: str = Field(default="", max_length=255)
     _validate_name = field_validator("name")(clean_name)
     _validate_phone = field_validator("phone")(clean_phone)
+class PublicEnquiryIn(LeadIn):
+    consent: bool = Field(default=False)
+    website: str = Field(default="", max_length=200)
+
 class PlotIn(BaseModel):
     project: str = Field(min_length=2, max_length=160)
     plot_number: str = Field(min_length=1, max_length=40)
@@ -182,9 +192,12 @@ class ReviewIn(BaseModel):
     channel: str = Field(default="manual", pattern="^(manual|email)$")
     consent_confirmed: bool
 
+def password_version(user: User) -> str:
+    return hmac.new(settings.app_secret_key.encode(), user.password_hash.encode(), hashlib.sha256).hexdigest()
+
 def issue_token(user: User) -> str:
     now = datetime.now(timezone.utc)
-    return jwt.encode({"sub": str(user.id), "role": user.role, "iat": now, "exp": now + timedelta(minutes=settings.access_token_minutes)}, settings.app_secret_key, algorithm="HS256")
+    return jwt.encode({"sub": str(user.id), "role": user.role, "pv": password_version(user), "iat": now, "exp": now + timedelta(minutes=settings.access_token_minutes)}, settings.app_secret_key, algorithm="HS256")
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(db_session)) -> User:
     if not credentials: raise HTTPException(status_code=401, detail="Authentication required")
@@ -195,6 +208,8 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user = db.get(User, user_id)
     if not user or not user.is_active: raise HTTPException(status_code=401, detail="Account unavailable")
+    if not hmac.compare_digest(str(payload.get("pv", "")), password_version(user)):
+        raise HTTPException(status_code=401, detail="Session expired; please sign in again")
     return user
 
 def require_roles(*roles: Role):
@@ -234,6 +249,17 @@ def login(data: LoginIn, request: Request, db: Session = Depends(db_session)):
     if not user or not password_hash.verify(data.password, user.password_hash) or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
     return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}}
 
+@app.post("/api/auth/password")
+@limiter.limit("5/minute")
+def change_password(data: PasswordChangeIn, request: Request, db: Session = Depends(db_session), user: User = Depends(current_user)):
+    if not password_hash.verify(data.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if data.new_password == data.current_password:
+        raise HTTPException(status_code=422, detail="Choose a different password")
+    user.password_hash = password_hash.hash(data.new_password)
+    db.commit()
+    return {"message": "Password updated. Sign in again."}
+
 @app.get("/api/me")
 def me(user: User = Depends(current_user)): return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}
 
@@ -256,17 +282,33 @@ def growth(initial_value: float = Query(gt=0, le=1e12), annual_growth_percent: f
     return {"future_value": round(future, 2), "gain": round(future - initial_value, 2)}
 
 @app.get("/api/leads")
-def list_leads(db: Session = Depends(db_session), user: User = Depends(current_user)):
-    query = select(Lead).order_by(Lead.created_at.desc())
-    if user.role != Role.admin.value: query = query.where(Lead.owner_id == user.id)
+def list_leads(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    query = select(Lead).order_by(Lead.created_at.desc()).limit(500)
     return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
-def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(current_user)):
+def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
     lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
-                email=str(data.email).lower() if data.email else None, interest=data.interest.strip())
+                email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip())
     db.add(lead); db.commit(); db.refresh(lead)
     return {"id": lead.id, "status": lead.status}
+
+@app.post("/api/public/enquiries", status_code=201)
+@limiter.limit("5/minute")
+def public_enquiry(data: PublicEnquiryIn, request: Request, db: Session = Depends(db_session)):
+    if not data.consent or data.website:
+        raise HTTPException(status_code=422, detail="Please confirm consent and submit a valid enquiry")
+    owner = db.scalar(select(User).where(User.role == Role.admin.value, User.is_active.is_(True)).order_by(User.id).limit(1))
+    if not owner:
+        raise HTTPException(status_code=503, detail="Enquiries temporarily unavailable")
+    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip())
+    db.add(item)
+    db.commit()
+    return {"message": "Your enquiry has been received."}
+
+@app.get("/api/customer/enquiries")
+def customer_enquiries(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
+    return [{"id": item.id, "interest": item.interest, "status": item.status, "created_at": item.created_at.isoformat()} for item in db.scalars(select(Lead).where(Lead.owner_id == user.id).order_by(Lead.id.desc()).limit(100))]
 
 @app.get("/api/admin/lead-notifications")
 def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
@@ -278,11 +320,10 @@ def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
              "created_at": lead.created_at.isoformat()} for lead in db.scalars(query)]
 
 @app.patch("/api/leads/{lead_id}/status")
-def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(current_user)):
+def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
     lead = db.get(Lead, lead_id)
-    if not lead or (user.role != Role.admin.value and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
-    if user.role not in {Role.admin.value, Role.agent.value}: raise HTTPException(status_code=403, detail="Only sales staff can change lead status")
+    if not lead: raise HTTPException(status_code=404, detail="Lead not found")
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
@@ -302,24 +343,22 @@ def create_referral(data: ReferralIn, db: Session = Depends(db_session), user: U
     return {"id": item.id, "status": item.status, "reward_amount": item.reward_amount}
 
 @app.get("/api/partners/referrals")
-def list_referrals(db: Session = Depends(db_session), user: User = Depends(current_user)):
+def list_referrals(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.partner))):
     query = select(Referral)
     if user.role != Role.admin.value: query = query.where(Referral.referrer_id == user.id)
-    return [{"id": r.id, "referred_name": r.referred_name, "status": r.status, "reward_amount": r.reward_amount} for r in db.scalars(query)]
+    return [{"id": r.id, "referred_name": r.referred_name if user.role == Role.admin.value else "Referral #" + str(r.id), "status": r.status, "reward_amount": r.reward_amount} for r in db.scalars(query)]
 
 @app.post("/api/reviews/requests", status_code=201)
-def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.agent))):
+def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     if not data.consent_confirmed: raise HTTPException(status_code=400, detail="Explicit customer consent is required before review outreach")
     customer = db.get(User, data.customer_id)
     if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
-    if user.role == Role.agent.value and not db.scalar(select(Lead.id).where(Lead.owner_id == user.id, Lead.email == customer.email).limit(1)):
-        raise HTTPException(status_code=404, detail="Customer not found in your assigned leads")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
     db.add(item); db.commit(); db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
 
 @app.get("/api/customer/portal")
-def customer_portal(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer, Role.admin))):
+def customer_portal(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
     refs = list(db.scalars(select(Referral).where(Referral.referrer_id == user.id)))
     return {"profile": {"id": user.id, "name": user.full_name, "email": user.email}, "referrals": [{"id": r.id, "status": r.status} for r in refs], "message": "Booking, payment and document records require verified business-system integration"}
 
