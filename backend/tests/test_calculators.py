@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 _test_dir = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = "sqlite:///" + _test_dir.name + "/import.db"
 os.environ["APP_ENV"] = "development"
+os.environ["REDIS_URL"] = ""
 os.environ["APP_SECRET_KEY"] = "test-only-secret-not-used-in-production-123456789"
 os.environ["BOOTSTRAP_ADMIN_EMAIL"] = ""
 os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = ""
@@ -98,3 +99,128 @@ def test_no_external_messaging(client):
     assert not any(key.startswith("whatsapp_") for key in m.Settings.model_fields)
     admin = login(client, "admin@example.com", "TestAdminPass123!")
     assert client.post("/api/reviews/requests", headers=admin, json={"customer_id": 1, "channel": "whatsapp", "consent_confirmed": True}).status_code == 422
+
+
+def make_user(client, admin, email, role):
+    password = "FixturePassword123!"
+    response = client.post("/api/admin/users", headers=admin, json={"email": email, "full_name": "Fixture User", "password": password, "role": role})
+    assert response.status_code == 201, response.text
+    return response.json()["id"], login(client, email, password)
+
+
+def test_plot_inventory_and_permissions(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "plotcustomer@example.com")
+    plot = {"project": "Test Enclave", "plot_number": "A1", "area_sqft": 1200, "rate_per_sqft": 3500, "status": "available", "x": 20, "y": 30}
+    assert client.post("/api/plots", headers=customer, json=plot).status_code == 403
+    response = client.post("/api/plots", headers=admin, json=plot)
+    assert response.status_code == 201, response.text
+    plot_id = response.json()["id"]
+    assert client.get("/api/plots").json()[0]["plot_number"] == "A1"
+    update = {**plot, "status": "reserved"}
+    assert client.patch(f"/api/admin/plots/{plot_id}", headers=admin, json=update).status_code == 200
+    assert client.get("/api/plots").json()[0]["status"] == "reserved"
+    assert client.post("/api/plots", headers=admin, json={**plot, "area_sqft": -1}).status_code == 422
+
+
+def test_partner_referral_and_approval(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    _, partner = make_user(client, admin, "partner@example.com", "partner")
+    _, other = make_user(client, admin, "otherpartner@example.com", "partner")
+    customer = register(client, "refcustomer@example.com")
+    data = {"referred_name": "Referral Test", "referred_phone": "9999999999"}
+    assert client.post("/api/partners/referrals", headers=customer, json=data).status_code == 403
+    response = client.post("/api/partners/referrals", headers=partner, json=data)
+    assert response.status_code == 201, response.text
+    rid = response.json()["id"]
+    assert client.get("/api/partners/referrals", headers=other).json() == []
+    assert client.get("/api/partners/referrals", headers=partner).json()[0]["status"] == "submitted"
+    decision = {"status": "approved", "reward_amount": 1000}
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=partner, json=decision).status_code == 403
+    assert client.patch(f"/api/admin/referrals/{rid}", headers=admin, json=decision).status_code == 200
+    assert client.get("/api/partners/referrals", headers=partner).json()[0]["reward_amount"] == 1000
+    assert client.get("/api/admin/referrals", headers=admin).json()[0]["status"] == "approved"
+
+
+def test_review_consent_and_customer_portal(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "portalcustomer@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    profile = client.get("/api/customer/portal", headers=customer)
+    assert profile.status_code == 200
+    assert profile.json()["profile"]["id"] == customer_id
+    payload = {"customer_id": customer_id, "channel": "manual", "consent_confirmed": False}
+    assert client.post("/api/reviews/requests", headers=admin, json=payload).status_code == 400
+    payload["consent_confirmed"] = True
+    assert client.post("/api/reviews/requests", headers=customer, json=payload).status_code == 403
+    response = client.post("/api/reviews/requests", headers=admin, json=payload)
+    assert response.status_code == 201, response.text
+    assert response.json()["delivery"] == "not_configured"
+    assert client.post("/api/reviews/requests", headers=admin, json={**payload, "customer_id": 1}).status_code == 404
+
+
+def test_admin_settings_audit_and_deactivation(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    uid, agent = make_user(client, admin, "agent@example.com", "agent")
+    payload = {"registration_percent": 4, "stamp_duty_percent": 5, "other_charges": 20000, "referral_reward_amount": 500}
+    assert client.patch("/api/admin/settings", headers=agent, json=payload).status_code == 403
+    assert client.patch("/api/admin/settings", headers=admin, json=payload).status_code == 200
+    assert client.get("/api/settings/calculator").json()["registration_percent"] == 4
+    assert any(a["action"] == "settings.updated" for a in client.get("/api/admin/audit", headers=admin).json())
+    assert client.get("/api/admin/audit", headers=agent).status_code == 403
+    assert client.patch(f"/api/admin/users/{uid}/active", headers=admin, params={"active": False}).status_code == 200
+    assert client.get("/api/me", headers=agent).status_code == 401
+
+
+def test_jwt_validation_and_lead_staff_only(client):
+    import jwt
+    from datetime import datetime, timedelta, timezone
+    customer = register(client, "securitycustomer@example.com")
+    me = client.get("/api/me", headers=customer)
+    uid = me.json()["id"]
+    assert me.headers["cache-control"] == "no-store"
+    now = datetime.now(timezone.utc)
+    forged = jwt.encode({"sub": str(uid), "iat": now, "exp": now + timedelta(minutes=5)}, "wrong-secret-not-the-server-key-123456789", algorithm="HS256")
+    expired = jwt.encode({"sub": str(uid), "iat": now - timedelta(hours=1), "exp": now - timedelta(minutes=1)}, m.settings.app_secret_key, algorithm="HS256")
+    missing_exp = jwt.encode({"sub": str(uid), "iat": now}, m.settings.app_secret_key, algorithm="HS256")
+    for token in (forged, expired, missing_exp):
+        assert client.get("/api/me", headers={"Authorization": "Bearer " + token}).status_code == 401
+    lead = client.post("/api/leads", headers=customer, json={"name": "Security Test", "phone": "9999999999"})
+    assert lead.status_code == 201
+    assert client.patch(f"/api/leads/{lead.json()['id']}/status", headers=customer, params={"new_status": "won"}).status_code == 403
+    assert client.get("/ready").json()["status"] == "ready"
+
+
+def test_login_rate_limit(client):
+    for _ in range(10):
+        assert client.post("/api/auth/login", json={"email": "unknown@example.com", "password": "incorrect"}).status_code == 401
+    assert client.post("/api/auth/login", json={"email": "unknown@example.com", "password": "incorrect"}).status_code == 429
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_versioned_migration(tmp_path, monkeypatch, legacy):
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+    from sqlalchemy import inspect, text
+    url = "sqlite:///" + str(tmp_path / "migration.db")
+    monkeypatch.setenv("DATABASE_URL", url)
+    engine = create_engine(url)
+    try:
+        if legacy:
+            m.Base.metadata.create_all(engine)
+            with engine.begin() as connection:
+                connection.execute(text("CREATE TABLE legacy_provider_history (id INTEGER PRIMARY KEY, message TEXT)"))
+                connection.execute(text("INSERT INTO legacy_provider_history VALUES (1, 'preserve')"))
+                connection.execute(text("INSERT INTO app_settings (key, value, updated_at) VALUES ('registration_percent', '7', CURRENT_TIMESTAMP)"))
+        cfg = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "head")
+        assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0001_baseline"
+            if legacy:
+                assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
+                assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
+    finally:
+        engine.dispose()
