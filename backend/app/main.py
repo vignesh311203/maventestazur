@@ -7,6 +7,8 @@ import jwt
 import hashlib
 import hmac
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -80,6 +82,8 @@ class Lead(Base):
     status: Mapped[str] = mapped_column(String(30), default="new")
     # Retain legacy database column for compatibility; no messaging or consent collection uses it.
     _legacy_consent: Mapped[bool] = mapped_column("consent_whatsapp", Boolean, default=False)
+    contact_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    contact_consent_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Plot(Base):
@@ -119,6 +123,10 @@ app.state.limiter = limiter
 if settings.app_env == "production":
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in settings.trusted_hosts.split(",") if host.strip()])
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]})
 app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
 
 @app.middleware("http")
@@ -144,6 +152,10 @@ class RegisterIn(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=2, max_length=160)
     password: str = Field(min_length=12, max_length=128)
+    @field_validator("full_name")
+    @classmethod
+    def validate_name(cls, value):
+        return clean_name(value)
 class PasswordChangeIn(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=12, max_length=128)
@@ -164,6 +176,7 @@ def clean_phone(value: str) -> str:
     return value
 
 class LeadIn(BaseModel):
+    consent: bool = False
     name: str = Field(min_length=2, max_length=160)
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
@@ -171,7 +184,6 @@ class LeadIn(BaseModel):
     _validate_name = field_validator("name")(clean_name)
     _validate_phone = field_validator("phone")(clean_phone)
 class PublicEnquiryIn(LeadIn):
-    consent: bool = Field(default=False)
     website: str = Field(default="", max_length=200)
 
 class PlotIn(BaseModel):
@@ -284,12 +296,15 @@ def growth(initial_value: float = Query(gt=0, le=1e12), annual_growth_percent: f
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     query = select(Lead).order_by(Lead.created_at.desc()).limit(500)
-    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status} for x in db.scalars(query)]
+    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
 def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
+    if user.role == Role.customer.value and not data.consent:
+        raise HTTPException(status_code=422, detail="Confirm contact consent before submitting")
     lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
-                email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip())
+                email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip(),
+                contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
     db.add(lead); db.commit(); db.refresh(lead)
     return {"id": lead.id, "status": lead.status}
 
@@ -301,7 +316,7 @@ def public_enquiry(data: PublicEnquiryIn, request: Request, db: Session = Depend
     owner = db.scalar(select(User).where(User.role == Role.admin.value, User.is_active.is_(True)).order_by(User.id).limit(1))
     if not owner:
         raise HTTPException(status_code=503, detail="Enquiries temporarily unavailable")
-    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip())
+    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), contact_consent_at=datetime.now(timezone.utc), contact_consent_version="2026-11-12")
     db.add(item)
     db.commit()
     return {"message": "Your enquiry has been received."}
