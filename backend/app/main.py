@@ -223,11 +223,14 @@ def list_leads(db: Session = Depends(db_session), user: User = Depends(current_u
 
 @app.post("/api/leads", status_code=201)
 def create_lead(data: LeadIn, background_tasks: BackgroundTasks, db: Session = Depends(db_session), user: User = Depends(current_user)):
-    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(), email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), consent_whatsapp=data.consent_whatsapp)
+    normalized_phone = data.phone.strip()
+    if data.consent_whatsapp:
+        try: normalized_phone = normalize_phone(data.phone)
+        except ValueError: raise HTTPException(status_code=422, detail="For WhatsApp consent, enter the phone number with country code, e.g. 91XXXXXXXXXX")
+    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=normalized_phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), consent_whatsapp=data.consent_whatsapp)
     db.add(lead); db.commit(); db.refresh(lead)
     if lead.consent_whatsapp:
-        try: save_whatsapp_consent(db, lead.phone, True, "lead_capture_checkbox", "Explicit WhatsApp consent recorded at lead creation")
-        except ValueError: raise HTTPException(status_code=422, detail="Enter phone number with country code, e.g. 91XXXXXXXXXX")
+        save_whatsapp_consent(db, lead.phone, True, "lead_capture_checkbox", "Explicit WhatsApp consent recorded at lead creation")
     background_tasks.add_task(send_lead_alert, lead.id)
     return {"id": lead.id, "status": lead.status, "whatsapp_alert": "internal_alert_queued" if settings.whatsapp_alert_recipients else "not_configured", "customer_whatsapp_consent": lead.consent_whatsapp}
 
