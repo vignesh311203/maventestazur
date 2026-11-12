@@ -77,3 +77,7 @@ All messaging API routes are authenticated. Customers can read only their own me
 The original pasted WhatsApp example is not enabled: a valid provider phone-number resource ID, a newly rotated access token and app secret, verified webhook signatures, durable provider event processing and provider-approved messaging policy would be prerequisites for a separate integration. Never commit credentials or send customer data to a messaging provider without the appropriate consent and operational controls.
 
 Messaging is in-website only; it does not send SMS, WhatsApp or email notifications. Customers must open their account to see replies. Staff must review and respond to conversations, and establish data retention and deletion procedures before wider commercial operation.
+
+### Quick property requests
+
+The customer chat includes Book Site Visit, Request Brochure and Call Me Back buttons. Each sends a private, persisted chat request and receives immediate guidance. Administrators see the requests in Messages and can reply. These actions do not automatically book a visit, arrange transport, initiate a call or deliver an unverified brochure. Callback contact details are shared voluntarily in the private chat. No external credentials are needed.
