@@ -15,7 +15,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -114,6 +114,17 @@ class ReviewRequest(Base):
     status: Mapped[str] = mapped_column(String(30), default="queued")
     consent_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+    __table_args__ = (UniqueConstraint("customer_id", "client_id", name="uq_support_customer_client"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sender: Mapped[str] = mapped_column(String(16))
+    client_id: Mapped[str] = mapped_column(String(80))
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
 
 password_hash = PasswordHash.recommended()
 bearer = HTTPBearer(auto_error=False)
@@ -510,3 +521,104 @@ def seed_business_settings():
         for key,value in DEFAULT_SETTINGS.items():
             if not db.scalar(select(AppSetting).where(AppSetting.key==key)): db.add(AppSetting(key=key,value=value))
         db.commit()
+
+
+# Private, durable web messaging. No external provider or customer contact details are transmitted.
+class SupportMessageIn(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
+    client_id: str = Field(min_length=16, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+
+    @field_validator("body")
+    @classmethod
+    def validate_body(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(ch) < 32 and ch not in "\n\t\r" for ch in value):
+            raise ValueError("Enter a valid message")
+        return value
+
+
+def support_reply(body: str) -> str:
+    text = body.casefold()
+    if any(word in text for word in ("book", "site visit", "visit", "appointment")):
+        return "Thanks for your message. Our property team can help arrange a site visit. Please share your preferred project and date here. A visit is confirmed only after our team responds."
+    if any(word in text for word in ("price", "cost", "emi", "budget", "loan", "rate")):
+        return "You can view available plot prices and use the EMI and plot cost calculators on our public website. Final prices, charges and loan eligibility need confirmation. Our property team can help with your questions."
+    if any(word in text for word in ("available", "availability", "plot", "project", "location")):
+        return "Please explore the published properties on our website and tell us which project or plot interests you. Our team will confirm availability and other details."
+    return "Thank you for contacting MetroEstate. Your message is saved in your private conversation with our property team. Please share your property requirements or question. A team member can reply here."
+
+
+def support_view(message: SupportMessage) -> dict:
+    return {"id": message.id, "sender": message.sender, "body": message.body, "created_at": message.created_at.isoformat()}
+
+
+def support_history(db: Session, customer_id: int, before_id: int | None, limit: int) -> list[dict]:
+    stmt = select(SupportMessage).where(SupportMessage.customer_id == customer_id)
+    if before_id is not None:
+        stmt = stmt.where(SupportMessage.id < before_id)
+    rows = list(db.scalars(stmt.order_by(SupportMessage.id.desc()).limit(limit)))
+    return [support_view(row) for row in reversed(rows)]
+
+
+def save_support(db: Session, customer_id: int, sender: str, data: SupportMessageIn) -> dict:
+    key = sender + ":" + data.client_id
+    existing = db.scalar(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.client_id == key))
+    if existing:
+        if existing.body != data.body:
+            raise HTTPException(status_code=409, detail="Message request ID already used")
+        return support_view(existing)
+    item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body)
+    db.add(item)
+    try:
+        db.flush()
+        if sender == "customer":
+            db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=support_reply(data.body)))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.client_id == key))
+        if not existing or existing.body != data.body:
+            raise HTTPException(status_code=409, detail="Message request conflict")
+        return support_view(existing)
+    return support_view(item)
+
+
+@app.get("/api/customer/messages")
+def customer_messages(before_id: int | None = Query(default=None, gt=0), limit: int = Query(default=50, ge=1, le=100), db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
+    return support_history(db, user.id, before_id, limit)
+
+
+@app.post("/api/customer/messages", status_code=201)
+@limiter.limit("20/minute")
+def send_customer_message(request: Request, data: SupportMessageIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
+    return save_support(db, user.id, "customer", data)
+
+
+@app.get("/api/admin/messages")
+def admin_message_threads(limit: int = Query(default=100, ge=1, le=200), db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    latest = select(SupportMessage.customer_id, func.max(SupportMessage.id).label("latest_id")).where(SupportMessage.sender != "assistant").group_by(SupportMessage.customer_id).subquery()
+    stmt = select(User, SupportMessage).join(latest, latest.c.customer_id == User.id).join(SupportMessage, SupportMessage.id == latest.c.latest_id).where(User.role == Role.customer.value).order_by(SupportMessage.id.desc()).limit(limit)
+    return [{"customer_id": customer.id, "name": customer.full_name, "email": customer.email, "last_message": message.body, "updated_at": message.created_at.isoformat(), "awaiting_reply": message.sender == "customer"} for customer, message in db.execute(stmt)]
+
+
+def support_customer(db: Session, customer_id: int):
+    customer = db.get(User, customer_id)
+    exists = db.scalar(select(SupportMessage.id).where(SupportMessage.customer_id == customer_id).limit(1))
+    if not customer or customer.role != Role.customer.value or not exists:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return customer
+
+
+@app.get("/api/admin/messages/{customer_id}")
+def admin_message_history(customer_id: int, before_id: int | None = Query(default=None, gt=0), limit: int = Query(default=50, ge=1, le=100), db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    support_customer(db, customer_id)
+    return support_history(db, customer_id, before_id, limit)
+
+
+@app.post("/api/admin/messages/{customer_id}", status_code=201)
+@limiter.limit("30/minute")
+def send_admin_message(request: Request, customer_id: int, data: SupportMessageIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    customer = support_customer(db, customer_id)
+    if not customer.is_active:
+        raise HTTPException(status_code=409, detail="Customer account is inactive")
+    return save_support(db, customer_id, "admin", data)
