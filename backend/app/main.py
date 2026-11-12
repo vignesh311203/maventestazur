@@ -5,6 +5,7 @@ from typing import Generator
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field
@@ -21,13 +22,24 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./dev.db"
     access_token_minutes: int = 30
     cors_origins: str = "http://localhost:5173"
+    redis_url: str = ""
+    trusted_hosts: str = "localhost,127.0.0.1,testserver"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
-if settings.app_env == "production" and len(settings.app_secret_key) < 32:
-    raise RuntimeError("APP_SECRET_KEY must be at least 32 characters in production")
+if settings.app_env == "production":
+    if len(settings.app_secret_key) < 32 or settings.app_secret_key.startswith("replace-"):
+        raise RuntimeError("Set a unique, random APP_SECRET_KEY for production")
+    if not settings.database_url.startswith("postgresql"):
+        raise RuntimeError("Production requires PostgreSQL")
+    if not settings.redis_url:
+        raise RuntimeError("Production requires Redis-backed rate limiting")
+    if not settings.trusted_hosts or "*" in settings.trusted_hosts:
+        raise RuntimeError("Production requires explicit TRUSTED_HOSTS")
+    if settings.bootstrap_admin_password and (len(settings.bootstrap_admin_password) < 16 or settings.bootstrap_admin_password.startswith("change-")):
+        raise RuntimeError("Set a strong, unique bootstrap administrator password")
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -91,12 +103,13 @@ class ReviewRequest(Base):
     consent_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-Base.metadata.create_all(bind=engine)
 password_hash = PasswordHash.recommended()
 bearer = HTTPBearer(auto_error=False)
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None)
+limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
+app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
 app.state.limiter = limiter
+if settings.app_env == "production":
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in settings.trusted_hosts.split(",") if host.strip()])
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
 
@@ -104,6 +117,8 @@ app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.co
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -152,7 +167,7 @@ def issue_token(user: User) -> str:
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(db_session)) -> User:
     if not credentials: raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        payload = jwt.decode(credentials.credentials, settings.app_secret_key, algorithms=["HS256"])
+        payload = jwt.decode(credentials.credentials, settings.app_secret_key, algorithms=["HS256"], options={"require": ["sub", "iat", "exp"]})
         user_id = int(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -168,6 +183,14 @@ def require_roles(*roles: Role):
 
 @app.get("/health")
 def health(): return {"status": "ok", "environment": settings.app_env}
+
+@app.get("/ready")
+def ready(db: Session = Depends(db_session)):
+    try:
+        db.execute(select(User.id).limit(1))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "ready"}
 
 @app.post("/api/auth/register", status_code=201)
 @limiter.limit("5/minute")
@@ -232,6 +255,7 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
     lead = db.get(Lead, lead_id)
     if not lead or (user.role != Role.admin.value and lead.owner_id != user.id): raise HTTPException(status_code=404, detail="Lead not found")
+    if user.role not in {Role.admin.value, Role.agent.value}: raise HTTPException(status_code=403, detail="Only sales staff can change lead status")
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
@@ -260,7 +284,7 @@ def list_referrals(db: Session = Depends(db_session), user: User = Depends(curre
 def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.agent))):
     if not data.consent_confirmed: raise HTTPException(status_code=400, detail="Explicit customer consent is required before review outreach")
     customer = db.get(User, data.customer_id)
-    if not customer: raise HTTPException(status_code=404, detail="Customer not found")
+    if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
     db.add(item); db.commit(); db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
@@ -296,7 +320,6 @@ class AdminAudit(Base):
     target: Mapped[str] = mapped_column(String(160), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-Base.metadata.create_all(bind=engine)
 DEFAULT_SETTINGS = {"registration_percent":"5.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
 
 class AdminUserIn(BaseModel):
