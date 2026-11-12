@@ -44,6 +44,10 @@ try{
   const plot=await post("/api/plots",{project:"Smoke Enclave",plot_number:"P101",area_sqft:1200,rate_per_sqft:3500,x:20,y:30},adminHeaders);assert.equal(plot.status(),201);
   await nav("Layout");await page.getByRole("button",{name:/P101/}).click();await page.getByText("Smoke Enclave · P101",{exact:true}).waitFor();
   console.log("PASS interactive admin plot inventory");
+  await page.getByRole("button",{name:"Edit plot",exact:true}).click();await page.getByLabel("rate per sqft",{exact:true}).fill("3600");
+  await page.getByRole("button",{name:"Save plot changes",exact:true}).click();await page.getByText("Plot updated.",{exact:true}).waitFor();
+  assert.equal((await (await page.request.get(api+"/api/plots")).json())[0].rate_per_sqft,3600);
+  console.log("PASS admin property editing");
   await page.getByRole("button",{name:"Sign out",exact:true}).click();
   await page.goto(web+"/customer");await page.getByRole("button",{name:"Create a customer account"}).click();await page.getByLabel("Full name",{exact:true}).fill("Smoke Customer");await page.getByLabel("Email",{exact:true}).fill(customerEmail);await page.getByLabel("Password",{exact:true}).fill(customerPassword);
   const registered=page.waitForResponse(r=>r.url().endsWith("/api/auth/register")&&r.request().method()==="POST");await page.getByRole("button",{name:"Create account",exact:true}).click();const reg=await registered;assert.equal(reg.status(),201);const customer=await reg.json();const customerHeaders=auth(customer.access_token);
@@ -63,16 +67,29 @@ try{
   await page.getByText(/You can view available plot prices/).waitFor();
   assert.equal((await page.request.get(api+"/api/admin/messages",{headers:customerHeaders})).status(),403);
   console.log("PASS private customer chat and automatic price guidance");
-  for(const [label,expected] of [["Book Site Visit","Your site-visit request has been saved"],["Request Brochure","Your brochure request has been saved"],["Call Me Back","Your callback request has been saved"]]){
-    await page.getByRole("button",{name:label,exact:true}).click();
-    await page.getByRole("log").getByText(expected,{exact:false}).waitFor();
-    await page.getByRole("button",{name:label,exact:true}).isEnabled();
-  }
-  console.log("PASS all three customer quick actions and automatic confirmations");
+  const log=page.getByRole("log");
+  await page.getByRole("button",{name:"Book Site Visit",exact:true}).click();await log.getByText(/Which project would you like to see/).waitFor();
+  await page.getByRole("button",{name:"Not sure yet",exact:true}).click();await log.getByText(/When would suit you for the visit/).waitFor();
+  await page.reload();await page.getByRole("button",{name:"Tomorrow",exact:true}).waitFor();
+  await page.getByRole("button",{name:"Tomorrow",exact:true}).click();await log.getByText(/best phone number/).waitFor();
+  await page.getByLabel("Your message",{exact:true}).fill("9999999999");await page.getByRole("button",{name:"Send message",exact:true}).click();await log.getByText(/May our property team contact you/).waitFor();
+  await page.getByRole("button",{name:"Yes, contact me",exact:true}).click();await log.getByText(/site-visit request has been saved/).waitFor();
+  await page.getByRole("button",{name:"Request Brochure",exact:true}).click();await log.getByText(/Which project would you like to get the brochure for/).waitFor();
+  await page.getByRole("button",{name:"Not sure yet",exact:true}).click();await log.getByText(/brochure request has been saved/).waitFor();
+  await page.getByRole("button",{name:"Call Me Back",exact:true}).click();await log.getByText(/When would suit you for the call/).waitFor();
+  await page.getByRole("button",{name:"Tomorrow",exact:true}).click();await page.getByRole("button",{name:"Chat only",exact:true}).click();await log.getByText(/callback request has been saved/).waitFor();
+  const ownLeads=await page.request.get(api+"/api/customer/enquiries",{headers:customerHeaders});assert.equal(ownLeads.status(),200);assert.equal((await ownLeads.json()).length,4);
+  console.log("PASS all three conversational requests, persistence and private lead creation");
   await page.goto(web+"/admin");await signIn(customerEmail,customerPassword);await page.getByText(/cannot access this panel/).waitFor();assert.equal(await page.getByRole("heading",{name:"Registered users"}).count(),0);
   console.log("PASS customer denied admin panel");
   await signIn(adminEmail,adminPassword);await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();await nav("Reviews");await page.getByLabel("Customer account ID").fill(String(customer.user.id));await page.getByRole("checkbox",{name:/explicitly agreed/}).check();const review=page.waitForResponse(r=>r.url().endsWith("/api/reviews/requests")&&r.request().method()==="POST");await page.getByRole("button",{name:"Record review request"}).click();assert.equal((await review).status(),201);
   console.log("PASS manual review consent");
+  await nav("Sheets");await page.getByRole("heading",{name:"Google Sheets synchronization"}).waitFor();await page.getByText("Not configured — records saved in PostgreSQL",{exact:true}).waitFor();
+  assert.equal((await page.request.get(api+"/api/admin/sheets/export",{headers:customerHeaders})).status(),403);
+  const report=await page.request.get(api+"/api/admin/sheets/export",{headers:adminHeaders});assert.equal(report.status(),200);assert.match(report.headers()["content-type"],/application\/zip/);
+  console.log("PASS admin-only reporting status and private CSV export");
+  await nav("Leads");await page.getByRole("row").filter({hasText:"Site visit: Not decided"}).waitFor();
+  console.log("PASS structured chat request reaches lead tracker");
   await nav("Messages");await page.getByRole("heading",{name:"Customer messages",exact:true}).waitFor();
   await page.getByRole("button").filter({hasText:customerEmail}).click();
   await page.getByRole("log").getByText("What is the plot price?",{exact:true}).waitFor();

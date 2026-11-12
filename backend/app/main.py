@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
+from .chatbot import respond, MENU
 from enum import Enum
 from typing import Generator
 from math import expm1, log1p
@@ -8,14 +9,14 @@ import hashlib
 import hmac
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -33,6 +34,9 @@ class Settings(BaseSettings):
     trusted_hosts: str = "localhost,127.0.0.1,testserver"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
+    google_sheets_enabled: bool = False
+    google_sheet_id: str = ""
+    google_service_account_json: SecretStr = SecretStr("")
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
@@ -84,6 +88,9 @@ class Lead(Base):
     _legacy_consent: Mapped[bool] = mapped_column("consent_whatsapp", Boolean, default=False)
     contact_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     contact_consent_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    request_type: Mapped[str] = mapped_column(String(30), default="enquiry", server_default="enquiry")
+    source: Mapped[str] = mapped_column(String(30), default="website", server_default="website")
+    preferred_time: Mapped[str] = mapped_column(String(80), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Plot(Base):
@@ -124,6 +131,13 @@ class SupportMessage(Base):
     client_id: Mapped[str] = mapped_column(String(80))
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class ChatState(Base):
+    __tablename__ = "chat_states"
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    state: Mapped[dict] = mapped_column(JSON, default=dict)
+    quick: Mapped[list] = mapped_column(JSON, default=lambda: list(MENU))
 
 
 password_hash = PasswordHash.recommended()
@@ -307,16 +321,16 @@ def growth(initial_value: float = Query(gt=0, le=1e12), annual_growth_percent: f
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     query = select(Lead).order_by(Lead.created_at.desc()).limit(500)
-    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None} for x in db.scalars(query)]
+    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "request_type": x.request_type, "source": x.source, "preferred_time": x.preferred_time, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
 @limiter.limit("20/minute")
 def create_lead(data: LeadIn, request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
     if user.role == Role.customer.value and not data.consent:
         raise HTTPException(status_code=422, detail="Confirm contact consent before submitting")
-    lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(),
+    lead = Lead(owner_id=user.id, name=user.full_name if user.role == Role.customer.value else data.name.strip(), phone=data.phone.strip(),
                 email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip(),
-                contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
+                source="customer" if user.role == Role.customer.value else "admin", contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
     db.add(lead); db.commit(); db.refresh(lead)
     return {"id": lead.id, "status": lead.status}
 
@@ -328,7 +342,7 @@ def public_enquiry(data: PublicEnquiryIn, request: Request, db: Session = Depend
     owner = db.scalar(select(User).where(User.role == Role.admin.value, User.is_active.is_(True)).order_by(User.id).limit(1))
     if not owner:
         raise HTTPException(status_code=503, detail="Enquiries temporarily unavailable")
-    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), contact_consent_at=datetime.now(timezone.utc), contact_consent_version="2026-11-12")
+    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), source="public", contact_consent_at=datetime.now(timezone.utc), contact_consent_version="2026-11-12")
     db.add(item)
     db.commit()
     return {"message": "Your enquiry has been received."}
@@ -498,6 +512,10 @@ def admin_list_referrals(db:Session=Depends(db_session), user:User=Depends(requi
 def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     item=db.get(Referral,referral_id)
     if not item: raise HTTPException(status_code=404,detail="Referral not found")
+    if item.status == "paid" and (data.status != "paid" or data.reward_amount != item.reward_amount):
+        raise HTTPException(status_code=409, detail="Paid reward records cannot be changed")
+    if data.status == "paid" and (item.status not in {"approved", "paid"} or data.reward_amount != item.reward_amount):
+        raise HTTPException(status_code=409, detail="Approve the reward before recording its verified payment")
     item.status=data.status; item.reward_amount=data.reward_amount; db.commit()
     write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}")
     return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
@@ -537,23 +555,6 @@ class SupportMessageIn(BaseModel):
         return value
 
 
-def support_reply(body: str) -> str:
-    text = body.casefold()
-    if text == "request brochure" or "brochure" in text:
-        return "Your brochure request has been saved. Please tell us which project interests you. Our property team can share verified project information and any available brochure here. In the meantime, explore the published plots on our website."
-    if text == "call me back" or "callback" in text or "call me back" in text:
-        return "Your callback request has been saved. Please share your preferred callback time and phone number in this private conversation if you agree to be contacted. Our property team will arrange the call; this is not an automated call or a confirmed appointment."
-    if text == "book site visit":
-        return "Your site-visit request has been saved. Please share the project, preferred date and time. A site visit is confirmed only after our property team responds. Transport arrangements, if available, will be confirmed separately."
-    if any(word in text for word in ("book", "site visit", "visit", "appointment")):
-        return "Thanks for your message. Our property team can help arrange a site visit. Please share your preferred project and date here. A visit is confirmed only after our team responds."
-    if any(word in text for word in ("price", "cost", "emi", "budget", "loan", "rate")):
-        return "You can view available plot prices and use the EMI and plot cost calculators on our public website. Final prices, charges and loan eligibility need confirmation. Our property team can help with your questions."
-    if any(word in text for word in ("available", "availability", "plot", "project", "location")):
-        return "Please explore the published properties on our website and tell us which project or plot interests you. Our team will confirm availability and other details."
-    return "Thank you for contacting MetroEstate. Your message is saved in your private conversation with our property team. Please share your property requirements or question. A team member can reply here."
-
-
 def support_view(message: SupportMessage) -> dict:
     return {"id": message.id, "sender": message.sender, "body": message.body, "created_at": message.created_at.isoformat()}
 
@@ -567,6 +568,10 @@ def support_history(db: Session, customer_id: int, before_id: int | None, limit:
 
 
 def save_support(db: Session, customer_id: int, sender: str, data: SupportMessageIn) -> dict:
+    # Serialize per-customer changes in PostgreSQL, including retries across replicas.
+    customer = db.scalar(select(User).where(User.id == customer_id).with_for_update())
+    if not customer or not customer.is_active:
+        raise HTTPException(status_code=409, detail="Customer account is inactive")
     key = sender + ":" + data.client_id
     existing = db.scalar(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.client_id == key))
     if existing:
@@ -578,7 +583,23 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
     try:
         db.flush()
         if sender == "customer":
-            db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=support_reply(data.body)))
+            state = db.get(ChatState, customer_id)
+            if state is None:
+                state = ChatState(customer_id=customer_id, state={}, quick=list(MENU))
+                db.add(state)
+            projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
+            available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
+            reply = respond(data.body, customer.full_name, state.state, projects, available)
+            state.state, state.quick = reply.state, reply.quick
+            db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text))
+            if reply.lead:
+                data_lead = reply.lead
+                db.add(Lead(owner_id=customer_id, name=customer.full_name, email=customer.email,
+                            phone=data_lead["phone"], interest=data_lead["interest"][:255], request_type=data_lead["request_type"],
+                            preferred_time=data_lead["preferred_time"], source="chat",
+                            contact_consent_at=datetime.now(timezone.utc) if data_lead["consent"] else None,
+                            contact_consent_version="2026-11-12" if data_lead["consent"] else None))
+
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -587,6 +608,12 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             raise HTTPException(status_code=409, detail="Message request conflict")
         return support_view(existing)
     return support_view(item)
+
+
+@app.get("/api/customer/chat-state")
+def customer_chat_state(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
+    state = db.get(ChatState, user.id)
+    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow"))}
 
 
 @app.get("/api/customer/messages")
@@ -628,3 +655,69 @@ def send_admin_message(request: Request, customer_id: int, data: SupportMessageI
     if not customer.is_active:
         raise HTTPException(status_code=409, detail="Customer account is inactive")
     return save_support(db, customer_id, "admin", data)
+
+
+# Durable reporting change markers. These contain no customer data or credentials.
+class SheetOutbox(Base):
+    __tablename__ = "sheet_outbox"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class SheetSyncStatus(Base):
+    __tablename__ = "sheet_sync_status"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sheet_id: Mapped[str] = mapped_column(String(200), default="")
+    last_success: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(String(200), default="")
+
+
+@event.listens_for(Session, "before_flush")
+def queue_reporting_changes(db, flush_context, instances):
+    watched = (Lead, SupportMessage, Plot, Referral, User)
+    if any(isinstance(obj, watched) for obj in db.new.union(db.deleted)) or any(isinstance(obj, watched) and db.is_modified(obj, include_collections=False) for obj in db.dirty):
+        db.add(SheetOutbox())
+
+
+@app.get("/api/admin/sheets/status")
+def sheets_status(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import configured
+    state = db.get(SheetSyncStatus, 1)
+    same = bool(state and state.sheet_id == settings.google_sheet_id)
+    return {"configured": configured(settings), "pending_changes": db.scalar(select(func.count(SheetOutbox.id))) or 0,
+            "last_success": state.last_success.isoformat() if same and state.last_success else None,
+            "last_error": state.last_error if state else "", "sheet_url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheet_id if configured(settings) else None}
+
+
+@app.post("/api/admin/sheets/sync", status_code=202)
+@limiter.limit("5/minute")
+def request_sheet_sync(request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import configured
+    if not configured(settings):
+        raise HTTPException(status_code=409, detail="Google Sheets is not configured")
+    db.add(SheetOutbox())
+    db.commit()
+    return {"message": "Sync queued. Check status for completion."}
+
+
+@app.get("/api/admin/sheets/export")
+@limiter.limit("5/minute")
+def export_reporting_data(request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .sheet_sync import snapshot, export_zip
+    return Response(export_zip(snapshot(db)), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="metroestate-private-report.zip"'})
+
+
+@app.on_event("startup")
+def start_sheets_worker():
+    from . import main
+    from .sheet_sync import start_worker
+    app.state.sheet_stop, app.state.sheet_worker = start_worker(main)
+
+
+@app.on_event("shutdown")
+def stop_sheets_worker():
+    stop = getattr(app.state, "sheet_stop", None)
+    worker = getattr(app.state, "sheet_worker", None)
+    if stop:
+        stop.set()
+    if worker:
+        worker.join(timeout=2)
