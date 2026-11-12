@@ -74,17 +74,21 @@ def test_lead_inbox_lifecycle(client):
     other = register(client, "other@example.com")
     assert client.get("/api/admin/lead-notifications").status_code == 401
     assert client.get("/api/admin/lead-notifications", headers=customer).status_code == 403
-    response = client.post("/api/leads", headers=customer, json={"name": "Test Customer", "phone": "9999999999", "email": None, "interest": "Plot"})
+    response = client.post("/api/leads", headers=customer, json={"name": "Test Customer", "phone": "9999999999", "email": None, "interest": "Plot", "consent": True})
     assert response.status_code == 201, response.text
     lead_id = response.json()["id"]
     assert response.json()["status"] == "new"
-    assert [x["id"] for x in client.get("/api/leads", headers=customer).json()] == [lead_id]
-    assert client.get("/api/leads", headers=other).json() == []
+    assert client.get("/api/leads", headers=customer).status_code == 403
+    own = client.get("/api/customer/enquiries", headers=customer).json()
+    assert [x["id"] for x in own] == [lead_id]
+    assert not {"name", "phone", "email"}.intersection(own[0])
+    assert client.get("/api/leads", headers=other).status_code == 403
+    assert client.get("/api/customer/enquiries", headers=other).json() == []
     assert [x["id"] for x in client.get("/api/leads", headers=admin).json()] == [lead_id]
     inbox = client.get("/api/admin/lead-notifications", headers=admin)
     assert inbox.status_code == 200
     assert [x["id"] for x in inbox.json()] == [lead_id]
-    assert client.patch(f"/api/leads/{lead_id}/status", headers=other, params={"new_status": "contacted"}).status_code == 404
+    assert client.patch(f"/api/leads/{lead_id}/status", headers=other, params={"new_status": "contacted"}).status_code == 403
     assert client.patch(f"/api/leads/{lead_id}/status", headers=admin, params={"new_status": "invalid"}).status_code == 422
     assert client.patch(f"/api/leads/{lead_id}/status", headers=admin, params={"new_status": "contacted"}).status_code == 200
     assert client.get("/api/admin/lead-notifications", headers=admin).json() == []
@@ -185,7 +189,7 @@ def test_jwt_validation_and_lead_staff_only(client):
     missing_exp = jwt.encode({"sub": str(uid), "iat": now}, m.settings.app_secret_key, algorithm="HS256")
     for token in (forged, expired, missing_exp):
         assert client.get("/api/me", headers={"Authorization": "Bearer " + token}).status_code == 401
-    lead = client.post("/api/leads", headers=customer, json={"name": "Security Test", "phone": "9999999999"})
+    lead = client.post("/api/leads", headers=customer, json={"name": "Security Test", "phone": "9999999999", "consent": True})
     assert lead.status_code == 201
     assert client.patch(f"/api/leads/{lead.json()['id']}/status", headers=customer, params={"new_status": "won"}).status_code == 403
     assert client.get("/ready").json()["status"] == "ready"
@@ -218,7 +222,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0001_baseline"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0002_contact_consent"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -232,9 +236,56 @@ def test_invalid_input_and_agent_review_scope(client):
     customer = register(client, "reviewtarget@example.com")
     customer_id = client.get("/api/me", headers=customer).json()["id"]
     request = {"customer_id": customer_id, "channel": "manual", "consent_confirmed": True}
-    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 404
+    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 403
     for bad in ({"name": "  ", "phone": "9999999999"}, {"name": "Test Name", "phone": "not-a-phone"}):
-        assert client.post("/api/leads", headers=agent, json=bad).status_code == 422
-    assert client.post("/api/leads", headers=agent, json={"name": "Test Name", "phone": "+91 99999 99999", "email": "reviewtarget@example.com"}).status_code == 201
-    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 201
+        assert client.post("/api/leads", headers=admin, json=bad).status_code == 422
+    assert client.post("/api/leads", headers=agent, json={"name": "Test Name", "phone": "+91 99999 99999", "email": "reviewtarget@example.com"}).status_code == 403
+    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 403
     assert client.post("/api/calculators/emi", params={"principal": 100000, "annual_rate_percent": 1e100, "months": 12}).status_code == 422
+
+
+def test_public_enquiry_privacy_and_consent(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    _, agent = make_user(client, admin, "privateagent@example.com", "agent")
+    _, partner = make_user(client, admin, "privatepartner@example.com", "partner")
+    customer = register(client, "privacycustomer@example.com")
+    data = {"name": "Private Enquirer", "phone": "9999999999", "email": "private@example.com", "interest": "Plot", "consent": True}
+    assert client.post("/api/public/enquiries", json={**data, "consent": False}).status_code == 422
+    assert client.post("/api/public/enquiries", json={**data, "website": "spam"}).status_code == 422
+    response = client.post("/api/public/enquiries", json=data)
+    assert response.status_code == 201, response.text
+    assert set(response.json()) == {"message"}
+    assert client.get("/api/leads").status_code == 401
+    for headers in (agent, partner, customer):
+        for path in ("/api/leads", "/api/admin/users", "/api/admin/lead-notifications", "/api/admin/referrals", "/api/admin/audit"):
+            assert client.get(path, headers=headers).status_code == 403
+    lead = client.get("/api/leads", headers=admin).json()[0]
+    assert lead["email"] == "private@example.com"
+    assert lead["contact_consent_at"]
+    assert client.get("/api/customer/enquiries", headers=customer).json() == []
+    assert client.post("/api/leads", headers=customer, json=data | {"consent": False}).status_code == 422
+    assert client.post("/api/leads", headers=customer, json=data).status_code == 201
+    own = client.get("/api/customer/enquiries", headers=customer).json()
+    assert len(own) == 1
+    assert set(own[0]) == {"id", "interest", "status", "created_at"}
+    assert client.get("/api/customer/enquiries", headers=partner).status_code == 403
+    assert client.get("/api/customer/enquiries", headers=admin).status_code == 403
+
+
+def test_password_rotation_revokes_old_session(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    payload = {"current_password": "wrong", "new_password": "NewPassword123456!"}
+    assert client.post("/api/auth/password", headers=admin, json=payload).status_code == 400
+    payload["current_password"] = "TestAdminPass123!"
+    assert client.post("/api/auth/password", headers=admin, json=payload).status_code == 200
+    assert client.get("/api/me", headers=admin).status_code == 401
+    assert client.post("/api/auth/login", json={"email": "admin@example.com", "password": "TestAdminPass123!"}).status_code == 401
+    updated = login(client, "admin@example.com", payload["new_password"])
+    assert client.get("/api/admin/users", headers=updated).status_code == 200
+
+
+def test_validation_does_not_echo_password(client):
+    response = client.post("/api/auth/register", json={"email":"valid@example.com","full_name":"Test","password":"secret"})
+    assert response.status_code == 422
+    assert "secret" not in response.text
+    assert all("input" not in error for error in response.json()["detail"])
