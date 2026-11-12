@@ -5,6 +5,9 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
@@ -39,14 +42,18 @@ jobs:
         run: docker compose up --build -d
       - name: Wait for API and frontend
         run: |
-          curl --fail --retry 60 --retry-delay 2 --retry-all-errors http://localhost:8000/health
+          curl --fail --retry 60 --retry-delay 2 --retry-all-errors http://localhost:8000/ready
           curl --fail --retry 60 --retry-delay 2 --retry-all-errors http://localhost:5173/
+      - name: Check exposed files and API schema version
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/.env)" = "403"
+          docker compose exec -T api alembic current | grep '0001_baseline'
       - name: Install browser test dependencies
         working-directory: frontend
         run: |
           npm install
           npx playwright install --with-deps chromium
-      - name: Verify ten application checklist items
+      - name: Verify ten application checks and remaining module workflows
         working-directory: frontend
         env:
           TEST_ADMIN_EMAIL: admin@example.com
@@ -58,3 +65,36 @@ jobs:
       - name: Remove disposable test stack
         if: always()
         run: docker compose down -v
+
+  security-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - name: Scan full Git history for credentials
+        run: |
+          docker run --rm -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.24.3 git --redact --log-opts="--all" /repo
+      - name: Check tracked secret and backup paths
+        run: |
+          if git ls-files | grep -E '(^|/)(\.env($|\.[^/]+$)|[^/]+\.(pem|key|db|sqlite|dump|sql\.gz)$)' | grep -vE '(^|/)\.env(\.production)?\.example$'; then
+            echo "Unexpected tracked credentials or database files"
+            exit 1
+          fi
+      - name: Python dependency and static security checks
+        run: |
+          python -m pip install pip-audit bandit
+          pip-audit -r backend/requirements.txt
+          bandit -r backend/app backend/alembic -ll -ii
+      - name: Frontend dependency audit
+        working-directory: frontend
+        run: |
+          npm install --no-audit
+          npm audit --audit-level=high
+      - name: Validate production Compose configuration
+        run: docker compose --env-file .env.production.example -f compose.production.yml config --quiet
