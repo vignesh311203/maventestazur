@@ -224,3 +224,17 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
     finally:
         engine.dispose()
+
+
+def test_invalid_input_and_agent_review_scope(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    _, agent = make_user(client, admin, "reviewagent@example.com", "agent")
+    customer = register(client, "reviewtarget@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    request = {"customer_id": customer_id, "channel": "manual", "consent_confirmed": True}
+    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 404
+    for bad in ({"name": "  ", "phone": "9999999999"}, {"name": "Test Name", "phone": "not-a-phone"}):
+        assert client.post("/api/leads", headers=agent, json=bad).status_code == 422
+    assert client.post("/api/leads", headers=agent, json={"name": "Test Name", "phone": "+91 99999 99999", "email": "reviewtarget@example.com"}).status_code == 201
+    assert client.post("/api/reviews/requests", headers=agent, json=request).status_code == 201
+    assert client.post("/api/calculators/emi", params={"principal": 100000, "annual_rate_percent": 1e100, "months": 12}).status_code == 422
