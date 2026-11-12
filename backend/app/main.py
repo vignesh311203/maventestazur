@@ -5,7 +5,7 @@ from typing import Generator
 import hashlib, hmac, json, re
 import httpx
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
@@ -222,10 +222,14 @@ def list_leads(db: Session = Depends(db_session), user: User = Depends(current_u
     return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "consent_whatsapp": x.consent_whatsapp} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
-def create_lead(data: LeadIn, db: Session = Depends(db_session), user: User = Depends(current_user)):
+def create_lead(data: LeadIn, background_tasks: BackgroundTasks, db: Session = Depends(db_session), user: User = Depends(current_user)):
     lead = Lead(owner_id=user.id, name=data.name.strip(), phone=data.phone.strip(), email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), consent_whatsapp=data.consent_whatsapp)
     db.add(lead); db.commit(); db.refresh(lead)
-    return {"id": lead.id, "status": lead.status, "whatsapp_alert": "queued_only_when_integrated" if lead.consent_whatsapp else "no_consent"}
+    if lead.consent_whatsapp:
+        try: save_whatsapp_consent(db, lead.phone, True, "lead_capture_checkbox", "Explicit WhatsApp consent recorded at lead creation")
+        except ValueError: raise HTTPException(status_code=422, detail="Enter phone number with country code, e.g. 91XXXXXXXXXX")
+    background_tasks.add_task(send_lead_alert, lead.id)
+    return {"id": lead.id, "status": lead.status, "whatsapp_alert": "internal_alert_queued" if settings.whatsapp_alert_recipients else "not_configured", "customer_whatsapp_consent": lead.consent_whatsapp}
 
 @app.patch("/api/leads/{lead_id}/status")
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(current_user)):
