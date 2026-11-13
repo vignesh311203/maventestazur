@@ -95,7 +95,7 @@ def respond(body, full_name, state=None, projects=None, available=0):
                 value = match
             elif text in SKIP:
                 value = "Not decided"
-            elif len(body.strip()) <= 80 and "?" not in body and not info(text, projects, available) and not phone_from(body) and not WHEN.search(body) and text not in YES | NO and not has(text, ("thank", "thanks", "brochure", "callback", "visit")):
+            elif len(body.strip()) <= 80 and "?" not in body and not re.match(r"^(what|why|how|where|which|who|can|could|is|are|does|do|tell me|explain|compare|would|should)\b", text) and not info(text, projects, available) and not phone_from(body) and not WHEN.search(body) and text not in YES | NO and not has(text, ("thank", "thanks", "brochure", "callback", "visit")):
                 value = body.strip()
         elif pending == "when":
             if len(body.strip()) <= 80 and WHEN.search(body) and not has(text, ("price", "cost", "loan", "emi", "budget")):

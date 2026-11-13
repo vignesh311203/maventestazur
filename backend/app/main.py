@@ -281,7 +281,10 @@ def browser_panel(request: Request) -> str | None:
     origin = request.headers.get("Origin")
     if origin and request.method not in {"GET", "HEAD", "OPTIONS"}:
         allowed = {v.strip().rstrip("/") for v in settings.cors_origins.split(",") if v.strip()}
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Untrusted request origin") from None
         same_host = parsed.netloc == request.headers.get("host") and parsed.scheme in ({"https"} if settings.app_env == "production" else {"http", "https"})
         if origin.rstrip("/") not in allowed and not same_host:
             raise HTTPException(status_code=403, detail="Untrusted request origin")

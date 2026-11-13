@@ -33,7 +33,8 @@ try{
   await page.goto(web+"/admin");await page.getByRole("heading",{name:"Administrator sign in"}).waitFor();await signIn(adminEmail,adminPassword);
   await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();
   await page.getByRole("row").filter({hasText:name}).waitFor();assert.equal(await page.locator("b[data-smoke=literal]").count(),0);
-  console.log("PASS separate admin sign in and notification inbox; no HTML injection");
+  assert.equal(await page.evaluate(()=>Object.keys(sessionStorage).some(k=>sessionStorage.getItem(k)?.split(".").length===3)),false);assert((await page.context().cookies()).some(c=>c.name==="metroestate_admin_session"&&c.httpOnly));
+  console.log("PASS separate admin sign in, HttpOnly cookie and notification inbox; no HTML injection");
   await nav("Leads");const row=page.getByRole("row").filter({hasText:name});await row.waitFor();
   console.log("PASS enquiry visible in admin lead tracker");
   const changed=page.waitForResponse(r=>r.url().includes("/api/leads/")&&r.request().method()==="PATCH");await row.getByRole("combobox").selectOption("contacted");assert.equal((await changed).status(),200);
@@ -41,16 +42,17 @@ try{
   await nav("Admin");const inbox=page.locator("section").filter({has:page.getByRole("heading",{name:"New enquiry notifications"})});await inbox.getByRole("button",{name:"Refresh",exact:true}).click();await inbox.getByRole("row").filter({hasText:name}).waitFor({state:"detached"});
   console.log("PASS contacted lead disappears after refresh");
   const adminLogin=await post("/api/auth/login",{email:adminEmail,password:adminPassword});assert.equal(adminLogin.status(),200);const adminHeaders=auth((await adminLogin.json()).access_token);
-  const plot=await post("/api/plots",{project:"Smoke Enclave",plot_number:"P101",area_sqft:1200,rate_per_sqft:3500,x:20,y:30},adminHeaders);assert.equal(plot.status(),201);
+  const plot=await post("/api/plots",{project:"Smoke Enclave",plot_number:"P101",area_sqft:1200,rate_per_sqft:3500,x:20,y:30,location_label:"Test location, Karnataka",latitude:12.9,longitude:77.6},adminHeaders);assert.equal(plot.status(),201);
   await nav("Layout");await page.getByRole("button",{name:/P101/}).click();await page.getByText("Smoke Enclave · P101",{exact:true}).waitFor();
-  console.log("PASS interactive admin plot inventory");
+  await page.getByRole("img",{name:"Rotatable schematic 3D plot model"}).waitFor();await page.getByRole("button",{name:"Aerial view",exact:true}).click();await page.getByRole("img",{name:"Schematic aerial plot layout"}).waitFor();await page.getByRole("button",{name:"3D view",exact:true}).click();await page.getByRole("link",{name:/Open in Google Maps/}).waitFor();
+  console.log("PASS interactive admin 3D/aerial plot inventory and verified location link");
   await page.getByRole("button",{name:"Edit plot",exact:true}).click();await page.getByLabel("rate per sqft",{exact:true}).fill("3600");
   await page.getByRole("button",{name:"Save plot changes",exact:true}).click();await page.getByText("Plot updated.",{exact:true}).waitFor();
   assert.equal((await (await page.request.get(api+"/api/plots")).json())[0].rate_per_sqft,3600);
   console.log("PASS admin property editing");
   await page.getByRole("button",{name:"Sign out",exact:true}).click();
   await page.goto(web+"/customer");await page.getByRole("button",{name:"Create a customer account"}).click();await page.getByLabel("Full name",{exact:true}).fill("Smoke Customer");await page.getByLabel("Email",{exact:true}).fill(customerEmail);await page.getByLabel("Password",{exact:true}).fill(customerPassword);
-  const registered=page.waitForResponse(r=>r.url().endsWith("/api/auth/register")&&r.request().method()==="POST");await page.getByRole("button",{name:"Create account",exact:true}).click();const reg=await registered;assert.equal(reg.status(),201);const customer=await reg.json();const customerHeaders=auth(customer.access_token);
+  const registered=page.waitForResponse(r=>r.url().endsWith("/api/auth/register")&&r.request().method()==="POST");await page.getByRole("button",{name:"Create account",exact:true}).click();const reg=await registered;assert.equal(reg.status(),201);const customer=await reg.json();assert.equal(customer.access_token,undefined);const customerLogin=await post("/api/auth/login",{email:customerEmail,password:customerPassword});assert.equal(customerLogin.status(),200);const customerHeaders=auth((await customerLogin.json()).access_token);
   await page.getByRole("heading",{name:"Welcome, Smoke Customer"}).waitFor();await noOverflow();
   assert.equal(await page.getByText(name,{exact:true}).count(),0);
   for(const path of ["/api/leads","/api/admin/users","/api/admin/lead-notifications","/api/admin/referrals","/api/admin/audit"]){assert.equal((await page.request.get(api+path,{headers:customerHeaders})).status(),403);}
@@ -87,7 +89,9 @@ try{
   await nav("Sheets");await page.getByRole("heading",{name:"Google Sheets synchronization"}).waitFor();await page.getByText("Not configured — records saved in PostgreSQL",{exact:true}).waitFor();
   assert.equal((await page.request.get(api+"/api/admin/sheets/export",{headers:customerHeaders})).status(),403);
   const report=await page.request.get(api+"/api/admin/sheets/export",{headers:adminHeaders});assert.equal(report.status(),200);assert.match(report.headers()["content-type"],/application\/zip/);
-  console.log("PASS admin-only reporting status and private CSV export");
+  await page.getByLabel("Authorized reporting email",{exact:true}).fill("reports@example.com");await page.getByLabel("Private Google Sheet URL or ID",{exact:true}).fill("test-private-report-123");await page.getByLabel("Current administrator password",{exact:true}).fill(adminPassword);await page.getByRole("button",{name:"Save reporting destinations",exact:true}).click();await page.getByText("Private reporting destinations saved.",{exact:true}).waitFor();
+  assert.equal((await (await page.request.get(api+"/api/admin/reports/config",{headers:adminHeaders})).json()).email,"reports@example.com");
+  console.log("PASS admin-only reporting configuration and private CSV export");
   await nav("Leads");await page.getByRole("row").filter({hasText:"Site visit: Not decided"}).waitFor();
   console.log("PASS structured chat request reaches lead tracker");
   await nav("Messages");await page.getByRole("heading",{name:"Customer messages",exact:true}).waitFor();
@@ -109,7 +113,7 @@ try{
   assert.equal((await page.request.patch(api+"/api/admin/referrals/"+refId,{headers:adminHeaders,data:{status:"approved",reward_amount:1000}})).status(),200);
   await page.getByRole("button",{name:"Refresh referrals"}).click();await page.getByRole("row").filter({hasText:"Referral #"+refId}).getByText("approved",{exact:true}).waitFor();
   console.log("PASS partner referral approval and masked personal details");
-  await page.goto(web+"/");await page.getByRole("heading",{name:"Smoke Enclave"}).waitFor();await page.getByRole("button",{name:"Enquire about this plot"}).click();assert.match(await page.getByLabel("Property interest").inputValue(),/P101/);
+  await page.goto(web+"/");await page.getByRole("heading",{name:"Smoke Enclave"}).waitFor();await page.getByRole("button",{name:"View 3D layout",exact:true}).click();await page.getByRole("img",{name:"Rotatable schematic 3D plot model"}).waitFor();await page.getByRole("button",{name:"Aerial view",exact:true}).click();await page.getByRole("img",{name:"Schematic aerial plot layout"}).waitFor();await page.getByRole("link",{name:/Open in Google Maps/}).waitFor();await noOverflow();await page.getByRole("button",{name:"Close model",exact:true}).click();await page.getByRole("button",{name:"Enquire about this plot"}).click();assert.match(await page.getByLabel("Property interest").inputValue(),/P101/);
   console.log("PASS public live inventory and property enquiry selection");
   assert.equal((await page.request.get(api+"/api/whatsapp/webhook")).status(),404);
   assert.equal((await page.request.get(api+"/api/admin/whatsapp/status")).status(),404);
