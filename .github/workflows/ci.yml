@@ -38,6 +38,43 @@ jobs:
         with: {python-version: "3.12"}
       - run: python -m pip install -r backend/requirements-dev.txt
       - run: cd backend && python -m pytest -q
+  backup-restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: metroestate_restore_source
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d metroestate_restore_source"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgresql+psycopg://test:test-only-password@localhost:5432/metroestate_restore_source
+      APP_ENV: development
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python -m pip install -r backend/requirements-dev.txt
+      - name: Migrate and seed disposable PostgreSQL
+        run: cd backend && alembic upgrade head && python -m app.restore_drill seed
+      - name: Dump and restore into a separate empty database
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          umask 077
+          docker exec "$PG_CONTAINER" pg_dump -U test -Fc metroestate_restore_source > /tmp/metroestate-ci.dump
+          docker exec "$PG_CONTAINER" createdb -U test metroestate_restore_target
+          docker exec -i "$PG_CONTAINER" pg_restore -U test --exit-on-error --no-owner --no-acl -d metroestate_restore_target < /tmp/metroestate-ci.dump
+          rm -f /tmp/metroestate-ci.dump
+      - name: Verify restored records and schema
+        env:
+          DATABASE_URL: postgresql+psycopg://test:test-only-password@localhost:5432/metroestate_restore_target
+        run: cd backend && python -m app.restore_drill verify
   frontend-build:
     runs-on: ubuntu-latest
     steps:
@@ -68,7 +105,7 @@ jobs:
       - name: Check exposed files and API schema version
         run: |
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/.env)" = "403"
-          docker compose exec -T api alembic current | grep '0010_inventory_review'
+          docker compose exec -T api alembic current | grep '0011_security_privacy'
       - name: Install browser test dependencies
         working-directory: frontend
         run: |

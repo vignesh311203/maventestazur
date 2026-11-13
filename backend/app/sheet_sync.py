@@ -31,6 +31,7 @@ def snapshot(db, external=False, full_customer_data=False):
         return users[uid].full_name if uid in users else ""
     data = {
         "Leads": [{"id": x.id, "created_at": iso(x.created_at), "name": x.name, "phone": x.phone, "email": x.email, "request_type": x.request_type, "source": x.source, "interest": x.interest, "preferred_time": x.preferred_time, "status": x.status, "contact_consent_at": iso(x.contact_consent_at)} for x in db.scalars(select(m.Lead).order_by(m.Lead.id))],
+        "Consent status": [{"lead_id": x.id, "consent_at": iso(x.contact_consent_at), "notice_version": x.contact_consent_version, "withdrawn_at": iso(x.contact_consent_withdrawn_at)} for x in db.scalars(select(m.Lead).order_by(m.Lead.id))],
         "Messages": [{"id": x.id, "created_at": iso(x.created_at), "customer_id": x.customer_id, "customer_name": name(x.customer_id), "sender": x.sender, "body": x.body} for x in db.scalars(select(m.SupportMessage).order_by(m.SupportMessage.id))],
         "Plots": [{"id": x.id, "project": x.project, "plot_number": x.plot_number, "area_sqft": x.area_sqft, "rate_per_sqft": x.rate_per_sqft, "total_price": round(x.area_sqft * x.rate_per_sqft, 2), "status": x.status, "map_x": x.x, "map_y": x.y, "location_label": x.location_label, "latitude": x.latitude, "longitude": x.longitude} for x in db.scalars(select(m.Plot).order_by(m.Plot.id))],
         "Referrals": [{"id": x.id, "partner_id": x.referrer_id, "partner_name": name(x.referrer_id), "referred_name": x.referred_name, "referred_phone": x.referred_phone, "status": x.status, "reward_amount": x.reward_amount} for x in referrals],
@@ -41,6 +42,11 @@ def snapshot(db, external=False, full_customer_data=False):
         "Locations": [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude} for p in db.scalars(select(m.Plot).order_by(m.Plot.id))],
         "Customers": [{"id": u.id, "name": u.full_name, "email": u.email, "is_active": u.is_active, "created_at": iso(u.created_at)} for u in users.values() if u.role == "customer"],
     }
+    if external:
+        withdrawn = {x['lead_id'] for x in data['Consent status'] if x['withdrawn_at']}
+        for row in data['Leads']:
+            if row['id'] in withdrawn:
+                row['phone'] = row['email'] = ""
     if external and not full_customer_data:
         # Keep contact and free-text customer content in the private application.
         for tab, keys in {"Leads":("name","phone","email","interest","preferred_time"),"Messages":("customer_name","body"),"Referrals":("referred_name","referred_phone","partner_name"),"Partners":("name","email"),"Customers":("name","email")}.items():

@@ -44,7 +44,7 @@ def login(client, email, password):
     return {"Authorization": "Bearer " + response.json()["access_token"]}
 
 def register(client, email):
-    response = client.post("/api/auth/register", json={"email": email, "full_name": "Test Customer", "password": "TestCustomerPass123!"})
+    response = client.post("/api/auth/register", json={"email": email, "full_name": "Test Customer", "password": "TestCustomerPass123!", "privacy_acknowledged": True})
     assert response.status_code == 201, response.text
     return {"Authorization": "Bearer " + response.json()["access_token"]}
 
@@ -229,7 +229,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_inventory_review"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_security_privacy"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -540,7 +540,7 @@ def test_cookie_sessions_are_role_scoped_and_revocable(client):
     assert "samesite=strict" in response.headers["set-cookie"].lower()
     assert client.get("/api/admin/users", headers=admin_panel).status_code == 200
     assert client.get("/api/admin/users").status_code == 401
-    register_response = client.post("/api/auth/register", headers=customer_panel, json={"email":"cookiecustomer@example.com","full_name":"Cookie Customer","password":"CookiePass123456!"})
+    register_response = client.post("/api/auth/register", headers=customer_panel, json={"email":"cookiecustomer@example.com","full_name":"Cookie Customer","password":"CookiePass123456!","privacy_acknowledged":True})
     assert register_response.status_code == 201, register_response.text
     assert client.get("/api/me", headers=customer_panel).json()["role"] == "customer"
     assert client.get("/api/admin/users", headers=customer_panel).status_code == 403
@@ -953,3 +953,106 @@ def test_admin_resolves_quarantined_inventory_without_deletion(client):
     assert [p["id"] for p in client.get("/api/plots").json()]==[ids[0]]
     assert len(client.get("/api/admin/plots",headers=admin).json())==2
     assert client.patch(f"/api/admin/plots/{ids[1]}",headers=admin,json=data).status_code==409
+
+
+def test_admin_mfa_enroll_replay_recovery_and_operator_reset(client,monkeypatch):
+    import pyotp
+    import time
+    from app import admin_security
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    customer=register(client,"mfa-customer@example.com")
+    assert client.get("/api/admin/mfa/status",headers=customer).status_code==403
+    credentials={"current_password":"TestAdminPass123!"}
+    assert client.post("/api/admin/mfa/start",headers=admin,json={"current_password":"incorrect"}).status_code==400
+    start=client.post("/api/admin/mfa/start",headers=admin,json=credentials)
+    assert start.status_code==200,start.text
+    secret=start.json()["secret"]
+    with m.SessionLocal() as db:
+        factor=db.scalar(m.select(m.AdminMfa))
+        assert secret not in factor.secret_ciphertext and not factor.enabled
+    now=int(time.time()//30)*30+5
+    monkeypatch.setattr(admin_security.time,"time",lambda:now)
+    code=pyotp.TOTP(secret).at(now)
+    confirm=client.post("/api/admin/mfa/confirm",headers=admin,json={**credentials,"code":code})
+    assert confirm.status_code==200,confirm.text
+    codes=confirm.json()["recovery_codes"]
+    assert len(codes)==10 and len(set(codes))==10
+    assert client.get("/api/me",headers=admin).status_code==401
+    payload={"email":"admin@example.com","password":"TestAdminPass123!"}
+    assert client.post("/api/auth/login",json=payload).status_code==401
+    assert client.post("/api/auth/login",json={**payload,"mfa_code":code}).status_code==401
+    fresh=pyotp.TOTP(secret).at(now+30)
+    signed=client.post("/api/auth/login",json={**payload,"mfa_code":fresh})
+    assert signed.status_code==200,signed.text
+    assert client.post("/api/auth/login",json={**payload,"mfa_code":fresh}).status_code==401
+    recovered=client.post("/api/auth/login",json={**payload,"mfa_code":codes[0]})
+    assert recovered.status_code==200,recovered.text
+    assert client.post("/api/auth/login",json={**payload,"mfa_code":codes[0]}).status_code==401
+    with m.SessionLocal() as db:
+        factor=db.scalar(m.select(m.AdminMfa))
+        assert len(factor.recovery_hashes)==9 and codes[0] not in str(factor.recovery_hashes)
+    from app.operator_recovery import reset
+    reset("admin@example.com","ReplacementPass12345!")
+    assert client.get("/api/me",headers={"Authorization":"Bearer "+recovered.json()["access_token"]}).status_code==401
+    assert client.post("/api/auth/login",json={**payload,"password":"ReplacementPass12345!"}).status_code==401
+
+
+def test_mfa_required_policy_preserves_enrollment_access(client,monkeypatch):
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    monkeypatch.setattr(m.settings,"admin_mfa_required",True)
+    assert client.get("/api/admin/users",headers=admin).status_code==403
+    assert client.get("/api/admin/mfa/status",headers=admin).json()["required"] is True
+    assert client.post("/api/admin/mfa/start",headers=admin,json={"current_password":"TestAdminPass123!"}).status_code==200
+
+
+def test_customer_privacy_export_and_erasure_scope(client):
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    owner=register(client,"privacy-owner@example.com")
+    other=register(client,"privacy-other@example.com")
+    assert client.get("/api/customer/privacy/export",headers=admin).status_code==403
+    assert client.get("/api/admin/privacy/requests",headers=owner).status_code==403
+    lead={"name":"Test Customer","phone":"9999999999","interest":"Owner private enquiry","consent":True}
+    assert client.post("/api/leads",headers=owner,json=lead).status_code==201
+    assert client.post("/api/leads",headers=other,json={**lead,"interest":"Other private enquiry"}).status_code==201
+    assert client.post("/api/customer/messages",headers=owner,json={"body":"Private account message","client_id":"privacy-owner-message-001","ai_consent":True}).status_code==201
+    data=client.get("/api/customer/privacy/export",headers=owner)
+    assert data.status_code==200 and data.headers["cache-control"]=="no-store"
+    assert data.json()["account"]["email"]=="privacy-owner@example.com"
+    assert data.json()["account"]["privacy_notice_version"]
+    assert len(data.json()["enquiries"])==1 and data.json()["enquiries"][0]["contact_consent_text"]
+    assert "Other private enquiry" not in data.text and "password_hash" not in data.text
+    assert data.json()["messages"][0]["ai_consent_text"]
+    pw={"current_password":"TestCustomerPass123!"}
+    assert client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"withdraw_contact"}).json()["status"]=="resolved"
+    assert client.get("/api/customer/privacy/export",headers=owner).json()["enquiries"][0]["contact_consent_withdrawn_at"]
+    from app.sheet_sync import snapshot
+    with m.SessionLocal() as db:
+        report=snapshot(db,external=True,full_customer_data=True)
+        withdrawn=next(x for x in report["Consent status"] if x["withdrawn_at"])
+        assert next(x for x in report["Leads"] if x["id"]==withdrawn["lead_id"])["phone"]==""
+    req=client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"erasure"}).json()
+    assert req["status"]=="pending"
+    assert client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"erasure"}).json()["id"]==req["id"]
+    assert client.get("/api/customer/privacy/requests",headers=other).json()==[]
+    url=f"/api/admin/privacy/requests/{req['id']}"
+    adm={"current_password":"TestAdminPass123!"}
+    assert client.patch(url,headers=owner,json={**adm,"decision":"erase_application"}).status_code==403
+    assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application"}).status_code==422
+    assert client.patch(url,headers=admin,json={**adm,"decision":"in_review"}).json()["status"]=="in_review"
+    assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application","retention_reviewed":True}).status_code==422
+    assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application","retention_reviewed":True,"external_copies_reviewed":True,"erasure_confirmation":"ERASE ACCOUNT"}).json()["status"]=="erased"
+    assert client.get("/api/customer/privacy/export",headers=owner).status_code==401
+    assert client.get("/api/customer/privacy/export",headers=other).json()["enquiries"][0]["interest"]=="Other private enquiry"
+    with m.SessionLocal() as db:
+        account=db.scalar(m.select(m.User).where(m.User.erased_at.is_not(None)))
+        assert account.full_name=="Erased customer" and not account.is_active
+        assert db.scalar(m.select(m.Lead).where(m.Lead.owner_id==account.id)) is None
+        assert db.scalar(m.select(m.SupportMessage).where(m.SupportMessage.customer_id==account.id)) is None
+        erased_id=account.id
+    assert client.patch(f"/api/admin/users/{erased_id}/active",headers=admin,params={"active":True}).status_code==409
+
+
+def test_registration_requires_notice_acknowledgement(client):
+    data={"email":"notice-test@example.com","full_name":"Notice Test","password":"NoticePassword123!"}
+    assert client.post("/api/auth/register",json=data).status_code==422
+    assert client.post("/api/auth/register",json={**data,"privacy_acknowledged":True}).status_code==201

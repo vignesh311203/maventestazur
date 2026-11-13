@@ -35,7 +35,10 @@ try{
   await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();
   await page.getByRole("row").filter({hasText:name}).waitFor();assert.equal(await page.locator("b[data-smoke=literal]").count(),0);
   assert.equal(await page.evaluate(()=>Object.keys(sessionStorage).some(k=>sessionStorage.getItem(k)?.split(".").length===3)),false);assert((await page.context().cookies()).some(c=>c.name==="metroestate_admin_session"&&c.httpOnly));
-  console.log("PASS separate admin sign in, HttpOnly cookie and notification inbox; no HTML injection");
+  await page.getByRole("heading",{name:"Administrator two-factor authentication"}).waitFor();
+  await page.getByRole("button",{name:"Set up MFA",exact:true}).waitFor();
+  await page.getByRole("heading",{name:"Customer privacy requests"}).waitFor();
+  console.log("PASS separate admin sign in, MFA setup and privacy workspace, HttpOnly cookie and notification inbox; no HTML injection");
   await nav("Leads");const row=page.getByRole("row").filter({hasText:name});await row.waitFor();
   console.log("PASS enquiry visible in admin lead tracker");
   const changed=page.waitForResponse(r=>r.url().includes("/api/leads/")&&r.request().method()==="PATCH");await row.getByRole("combobox").selectOption("contacted");assert.equal((await changed).status(),200);
@@ -61,7 +64,15 @@ try{
   console.log("PASS admin property editing");
   await page.getByRole("button",{name:"Sign out",exact:true}).click();
   await page.goto(web+"/customer");await page.getByRole("button",{name:"Create a customer account"}).click();await page.getByLabel("Full name",{exact:true}).fill("Smoke Customer");await page.getByLabel("Email",{exact:true}).fill(customerEmail);await page.getByLabel("Password",{exact:true}).fill(customerPassword);
+  await page.getByRole("checkbox",{name:/I acknowledge the privacy notice/}).check();
   const registered=page.waitForResponse(r=>r.url().endsWith("/api/auth/register")&&r.request().method()==="POST");await page.getByRole("button",{name:"Create account",exact:true}).click();const reg=await registered;assert.equal(reg.status(),201);const customer=await reg.json();assert.equal(customer.access_token,undefined);const customerLogin=await post("/api/auth/login",{email:customerEmail,password:customerPassword});assert.equal(customerLogin.status(),200);const customerHeaders=auth((await customerLogin.json()).access_token);
+  await page.getByRole("heading",{name:"My privacy",exact:true}).waitFor();
+  await page.getByRole("button",{name:"Download my data",exact:true}).waitFor();
+  await page.getByLabel("Privacy request current password",{exact:true}).fill(customerPassword);
+  const privacyRequest=page.waitForResponse(r=>r.url().endsWith("/api/customer/privacy/requests")&&r.request().method()==="POST");
+  await page.getByRole("button",{name:"Submit privacy request",exact:true}).click();assert.equal((await privacyRequest).status(),201);
+  await page.getByText("Privacy request recorded for administrator review.",{exact:true}).waitFor();
+  console.log("PASS customer privacy request intake");
   await page.getByRole("heading",{name:"Welcome, Smoke Customer"}).waitFor();await noOverflow();
   assert.equal(await page.getByText(name,{exact:true}).count(),0);
   for(const path of ["/api/leads","/api/admin/users","/api/admin/lead-notifications","/api/admin/referrals","/api/admin/audit"]){assert.equal((await page.request.get(api+path,{headers:customerHeaders})).status(),403);}
