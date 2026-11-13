@@ -12,6 +12,7 @@ TABS = {
     "Partners": ["id", "name", "email", "is_active", "referrals_total", "referrals_approved", "rewards_approved", "rewards_paid"],
     "Customers": ["id", "name", "email", "is_active", "created_at"],
     "PlotFinance": ["id", "project", "plot_number", "corner_plot", "corner_premium_percent", "guidance_value", "width_ft", "depth_ft"],
+    "Plot details": ["id", "project", "plot_number", "description", "amenities", "approval_details", "facing", "road_width_ft", "has_photo"],
     "Locations": ["id", "project", "plot_number", "location_label", "latitude", "longitude"],
 }
 API = "https://sheets.googleapis.com/v4/spreadsheets"

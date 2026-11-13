@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from .chatbot import respond, MENU
 from .finance import router as finance_router
 from enum import Enum
-from typing import Generator
+from typing import Generator, Literal
 from math import expm1, log1p
 import jwt
 import hashlib
@@ -20,7 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     ai_enabled: bool = False
     openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-5.6-terra"
+    ai_provider: Literal["openai", "anthropic"] = "openai"
+    anthropic_api_key: SecretStr = SecretStr("")
+    anthropic_model: str = "claude-sonnet-4-6"
+    assistant_name: str = "Riya"
     smtp_host: str = ""
     smtp_port: int = Field(default=587, ge=1, le=65535)
     smtp_username: str = ""
@@ -137,6 +141,17 @@ class Plot(Base):
     guidance_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     width_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
     depth_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
+    amenities: Mapped[str] = mapped_column(Text, default="", server_default="")
+    approval_details: Mapped[str] = mapped_column(Text, default="", server_default="")
+    facing: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    road_width_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+class PlotPhoto(Base):
+    __tablename__ = "plot_photos"
+    plot_id: Mapped[int] = mapped_column(ForeignKey("plots.id", ondelete="CASCADE"), primary_key=True)
+    jpeg: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
 
 class Referral(Base):
     __tablename__ = "referrals"
@@ -204,6 +219,39 @@ async def security_headers(request: Request, call_next):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
+class PlotRequestLimit:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not ((scope["method"] == "POST" and path == "/api/plots") or (scope["method"] == "PATCH" and path.startswith("/api/admin/plots/"))):
+            return await self.app(scope, receive, send)
+        limit = 3_000_000
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > limit:
+                return await JSONResponse(status_code=413, content={"detail": "Plot request exceeds 3 MB"}, headers={"Cache-Control":"no-store", "X-Content-Type-Options":"nosniff"})(scope, receive, send)
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+        delivered = False
+        async def replay():
+            nonlocal delivered
+            if delivered:
+                return await receive()
+            delivered = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+        return await self.app(scope, replay, send)
+
+
+app.add_middleware(PlotRequestLimit)
+
+
 def db_session() -> Generator[Session, None, None]:
     db = SessionLocal()
     try: yield db
@@ -263,9 +311,18 @@ class PlotIn(BaseModel):
     guidance_value: float | None = Field(default=None, gt=0, le=1e12)
     width_ft: float | None = Field(default=None, gt=0, le=100000)
     depth_ft: float | None = Field(default=None, gt=0, le=100000)
+    description: str = Field(default="", max_length=3000)
+    amenities: str = Field(default="", max_length=1500)
+    approval_details: str = Field(default="", max_length=1500)
+    facing: Literal["", "North", "South", "East", "West", "North-East", "North-West", "South-East", "South-West"] = ""
+    road_width_ft: float | None = Field(default=None, gt=0, le=1000)
+    photo_data: str | None = Field(default=None, max_length=2796204, exclude=True)
+    remove_photo: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def validate_location(self):
+        if self.photo_data and self.remove_photo:
+            raise ValueError("Choose either replace or remove photo")
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError("Provide both latitude and longitude, or leave both blank")
         if (self.width_ft is None) != (self.depth_ft is None):
@@ -498,14 +555,66 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
+def plot_view(p: Plot, has_photo: bool) -> dict:
+    return {"id": p.id, "project": p.project, "plot_number": p.plot_number,
+            "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status,
+            "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude,
+            "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent,
+            "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft,
+            "description": p.description, "amenities": p.amenities, "approval_details": p.approval_details,
+            "facing": p.facing, "road_width_ft": p.road_width_ft,
+            "photo_url": f"/api/plots/{p.id}/photo" if has_photo else None}
+
+
+def prepare_photo(data: PlotIn):
+    from .plot_media import normalize_photo
+    if data.photo_data is not None:
+        try:
+            return normalize_photo(data.photo_data)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+    return None
+
+
+def apply_plot_photo(db: Session, plot_id: int, data: PlotIn, jpeg):
+    old = db.get(PlotPhoto, plot_id)
+    if jpeg is not None:
+        if old:
+            old.jpeg = jpeg
+        else:
+            db.add(PlotPhoto(plot_id=plot_id, jpeg=jpeg))
+        return True
+    if data.remove_photo and old:
+        db.delete(old)
+        return False
+    return old is not None
+
+
 @app.get("/api/plots")
 def list_plots(db: Session = Depends(db_session)):
-    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent, "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+    photo_ids = set(db.scalars(select(PlotPhoto.plot_id)))
+    return [plot_view(p, p.id in photo_ids) for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+
+
+@app.get("/api/plots/{plot_id}/photo")
+def get_plot_photo(plot_id: int, db: Session = Depends(db_session)):
+    photo = db.get(PlotPhoto, plot_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Property photo unavailable")
+    return Response(photo.jpeg, media_type="image/jpeg", headers={"Content-Disposition": "inline", "Cache-Control": "no-store"})
+
 
 @app.post("/api/plots", status_code=201)
 def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
-    plot = Plot(**data.model_dump()); db.add(plot); db.commit(); db.refresh(plot)
-    return {"id": plot.id, **data.model_dump()}
+    jpeg = prepare_photo(data)
+    plot = Plot(**data.model_dump())
+    db.add(plot)
+    db.flush()
+    has_photo = apply_plot_photo(db, plot.id, data, jpeg)
+    db.commit()
+    db.refresh(plot)
+    return plot_view(plot, has_photo)
+
 
 @app.post("/api/partners/referrals", status_code=201)
 def create_referral(data: ReferralIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.partner, Role.admin))):
@@ -651,10 +760,12 @@ def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=D
 def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     item=db.get(Plot,plot_id)
     if not item: raise HTTPException(status_code=404,detail="Plot not found")
-    for key,value in data.model_dump().items(): setattr(item,key,value)
+    jpeg = prepare_photo(data)
+    for key,value in data.model_dump(exclude_unset=True).items(): setattr(item,key,value)
+    has_photo = apply_plot_photo(db, item.id, data, jpeg)
     db.commit()
     write_admin_audit(db,user,"plot.updated",str(item.id))
-    return {"id":item.id,**data.model_dump()}
+    return plot_view(item, has_photo)
 
 @app.get("/api/admin/audit")
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
@@ -668,7 +779,36 @@ def seed_business_settings():
         db.commit()
 
 
-# Private, durable web messaging. No external provider or customer contact details are transmitted.
+# Private messaging. Optional AI receives consented chat context and public inventory.
+def ai_configured() -> bool:
+    key = settings.anthropic_api_key if settings.ai_provider == "anthropic" else settings.openai_api_key
+    return bool(settings.ai_enabled and key.get_secret_value())
+
+
+def plot_tool_handlers(db: Session) -> dict:
+    def row(p):
+        return {"project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft,
+                "rate_per_sqft": p.rate_per_sqft, "base_price_inr": round(p.area_sqft * p.rate_per_sqft, 2),
+                "location": p.location_label, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent}
+    def search_plots(project=None, max_budget_inr=None, min_area_sqft=None, max_area_sqft=None):
+        from math import isfinite
+        stmt = select(Plot).where(Plot.status == "available")
+        if project:
+            stmt = stmt.where(Plot.project.ilike("%" + str(project)[:80].replace("%", "").replace("_", "") + "%"))
+        for column, raw, lower in ((Plot.area_sqft, min_area_sqft, True), (Plot.area_sqft, max_area_sqft, False), (Plot.area_sqft * Plot.rate_per_sqft, max_budget_inr, False)):
+            if raw is not None:
+                n = float(raw)
+                if not isfinite(n) or n < 0:
+                    raise ValueError("Use finite nonnegative search bounds")
+                stmt = stmt.where(column >= n if lower else column <= n)
+        rows = list(db.scalars(stmt.order_by(Plot.area_sqft * Plot.rate_per_sqft, Plot.id).limit(8)))
+        return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
+    def plot_base_price(project, plot_number):
+        p = db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
+        return row(p) if p else {"error": "No available matching plot."}
+    return {"search_plots": search_plots, "plot_base_price": plot_base_price}
+
+
 class SupportMessageIn(BaseModel):
     body: str = Field(min_length=1, max_length=2000)
     client_id: str = Field(min_length=16, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
@@ -719,15 +859,23 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
             reply = respond(data.body, customer.full_name, state.state, projects, available)
             # The model can answer questions, never create a lead or alter slots.
-            if data.ai_consent and settings.ai_enabled and settings.openai_api_key.get_secret_value() and not reply.lead and reply.state == (state.state or {}):
-                from .ai_support import answer_question, eligible_question
-                if eligible_question(data.body):
-                    public_plots = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
-                    ai_text = answer_question(data.body, public_plots, settings.openai_api_key.get_secret_value(), settings.openai_model)
-                    if ai_text:
-                        if reply.state.get("flow"):
-                            ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
-                        reply.text = ai_text
+            if data.ai_consent and ai_configured() and not reply.lead and reply.state == (state.state or {}):
+                ai_text = None
+                if settings.ai_provider == "anthropic":
+                    from .agent_ai import converse, agent_eligible
+                    if agent_eligible(data.body):
+                        recent = list(db.scalars(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.sender.in_(["customer", "assistant"])).order_by(SupportMessage.id.desc()).limit(14)))
+                        history = [{"sender": x.sender, "body": x.body} for x in reversed(recent)]
+                        ai_text = converse(history, plot_tool_handlers(db), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name)
+                else:
+                    from .ai_support import answer_question, eligible_question
+                    if eligible_question(data.body):
+                        public_plots = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
+                        ai_text = answer_question(data.body, public_plots, settings.openai_api_key.get_secret_value(), settings.openai_model)
+                if ai_text:
+                    if reply.state.get("flow"):
+                        ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
+                    reply.text = ai_text
             state.state, state.quick = reply.state, reply.quick
             db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text))
             if reply.lead:
@@ -751,7 +899,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
 @app.get("/api/customer/chat-state")
 def customer_chat_state(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
     state = db.get(ChatState, user.id)
-    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow")), "ai_available": bool(settings.ai_enabled and settings.openai_api_key.get_secret_value())}
+    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow")), "ai_available": ai_configured()}
 
 
 @app.get("/api/customer/messages")
@@ -842,7 +990,7 @@ def reporting_config(db: Session):
 @app.get("/api/admin/reports/config")
 def get_report_config(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     from .report_mail import email_ready
-    return {**reporting_config(db), "email_ready": email_ready(settings), "ai_available": bool(settings.ai_enabled and settings.openai_api_key.get_secret_value())}
+    return {**reporting_config(db), "email_ready": email_ready(settings), "ai_available": ai_configured()}
 
 @app.patch("/api/admin/reports/config")
 @limiter.limit("5/minute")
