@@ -11,22 +11,25 @@ export default function SupportChat({token,admin=false}){
  async function refreshState(){const state=await api("/api/customer/chat-state");setQuick(state.quick);setInProgress(state.in_progress);setAiAvailable(Boolean(state.ai_available));}
  const path=admin?selected?"/api/admin/messages/"+selected:null:"/api/customer/messages";
  async function api(path,body){
-   const res=await fetch(API+path,{method:body?"POST":"GET",credentials:"include",headers:{"Content-Type":"application/json","X-Session-Panel":admin?"admin":"customer"},...(body?{body:JSON.stringify(body)}:{})});
+   const res=await fetch(API+path,{method:body?"POST":"GET",credentials:"include",signal:AbortSignal.timeout(25000),headers:{"Content-Type":"application/json","X-Session-Panel":admin?"admin":"customer"},...(body?{body:JSON.stringify(body)}:{})});
    const data=await res.json().catch(()=>({}));
    if(!res.ok)throw new Error(typeof data.detail==="string"?data.detail:"Unable to complete request. Please try again.");
    return data;
  }
  useEffect(()=>{
    let active=true;
+   let refreshing=false;
    async function refresh(){
+     if(document.hidden||refreshing)return;
+     refreshing=true;
      try{
        if(admin){const rows=await api("/api/admin/messages");if(active)setThreads(rows);}
        if(!admin){const state=await api("/api/customer/chat-state");if(active){setQuick(state.quick);setInProgress(state.in_progress);setAiAvailable(Boolean(state.ai_available));}}
        if(path){const rows=await api(path+"?limit=50");if(active){setMessages(prev=>{const merged=new Map(prev.map(x=>[x.id,x]));rows.forEach(x=>merged.set(x.id,x));return [...merged.values()].sort((a,b)=>a.id-b.id)});setOlder(prev=>prev||rows.length===50);}}
-     }catch(e){if(active)setError(e.message);}
+     }catch(e){if(active)setError(e.message);}finally{refreshing=false;}
    }
    setMessages([]);setOlder(false);setDraft("");setError("");attempt.current=null;
-   refresh();const timer=setInterval(refresh,10000);return()=>{active=false;clearInterval(timer);};
+   refresh();const timer=setInterval(refresh,10000);document.addEventListener("visibilitychange",refresh);return()=>{active=false;clearInterval(timer);document.removeEventListener("visibilitychange",refresh);};
  },[token,admin,selected]);
  async function send(e,quickBody=null){
    e.preventDefault();const body=(quickBody??draft).trim();if(busy||!path||!body)return;

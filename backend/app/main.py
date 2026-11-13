@@ -890,7 +890,7 @@ def ai_configured() -> bool:
     return bool(settings.ai_enabled and key.get_secret_value())
 
 
-def plot_tool_handlers(db: Session) -> dict:
+def plot_tool_handlers() -> dict:
     def row(p):
         return {"project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft,
                 "rate_per_sqft": p.rate_per_sqft, "base_price_inr": round(p.area_sqft * p.rate_per_sqft, 2),
@@ -906,11 +906,13 @@ def plot_tool_handlers(db: Session) -> dict:
                 if not isfinite(n) or n < 0:
                     raise ValueError("Use finite nonnegative search bounds")
                 stmt = stmt.where(column >= n if lower else column <= n)
-        rows = list(db.scalars(stmt.order_by(Plot.area_sqft * Plot.rate_per_sqft, Plot.id).limit(8)))
-        return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
+        with SessionLocal() as tool_db:
+            rows = list(tool_db.scalars(stmt.order_by(Plot.area_sqft * Plot.rate_per_sqft, Plot.id).limit(8)))
+            return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
     def plot_base_price(project, plot_number):
-        p = db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
-        return row(p) if p else {"error": "No available matching plot."}
+        with SessionLocal() as tool_db:
+            p = tool_db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
+            return row(p) if p else {"error": "No available matching plot."}
     return {"search_plots": search_plots, "plot_base_price": plot_base_price}
 
 
@@ -953,6 +955,8 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
         return support_view(existing)
     item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body)
     db.add(item)
+    ai_job = None
+    assistant = None
     try:
         db.flush()
         if sender == "customer":
@@ -963,26 +967,22 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
             reply = respond(data.body, customer.full_name, state.state, projects, available)
-            # The model can answer questions, never create a lead or alter slots.
+            # Collect bounded public data and consented context; persist a fallback first.
             if data.ai_consent and ai_configured() and not reply.lead and reply.state == (state.state or {}):
-                ai_text = None
                 if settings.ai_provider == "anthropic":
                     from .agent_ai import converse, agent_eligible
                     if agent_eligible(data.body):
                         recent = list(db.scalars(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.sender.in_(["customer", "assistant"])).order_by(SupportMessage.id.desc()).limit(14)))
                         history = [{"sender": x.sender, "body": x.body} for x in reversed(recent)]
-                        ai_text = converse(history, plot_tool_handlers(db), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name)
+                        ai_job = (converse, (history, plot_tool_handlers(), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name))
                 else:
                     from .ai_support import answer_question, eligible_question
                     if eligible_question(data.body):
-                        public_plots = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
-                        ai_text = answer_question(data.body, public_plots, settings.openai_api_key.get_secret_value(), settings.openai_model)
-                if ai_text:
-                    if reply.state.get("flow"):
-                        ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
-                    reply.text = ai_text
+                        inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
+                        ai_job = (answer_question, (data.body, inventory, settings.openai_api_key.get_secret_value(), settings.openai_model))
             state.state, state.quick = reply.state, reply.quick
-            db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text))
+            assistant = SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text)
+            db.add(assistant)
             if reply.lead:
                 data_lead = reply.lead
                 db.add(Lead(owner_id=customer_id, name=customer.full_name, email=customer.email,
@@ -998,7 +998,28 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
         if not existing or existing.body != data.body:
             raise HTTPException(status_code=409, detail="Message request conflict")
         return support_view(existing)
-    return support_view(item)
+    result = support_view(item)
+    if ai_job and assistant is not None:
+        assistant_id = assistant.id
+        # Release the user lock and pool connection before provider network I/O.
+        db.close()
+        try:
+            fn, args = ai_job
+            ai_text = fn(*args)
+        except Exception as exc:
+            logger.warning("ai_advisor_failed error_type=%s", type(exc).__name__)
+            ai_text = None
+        if ai_text:
+            if reply.state.get("flow"):
+                ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
+            with SessionLocal() as update_db:
+                active = update_db.scalar(select(User).where(User.id == customer_id).with_for_update())
+                latest = update_db.scalar(select(func.max(SupportMessage.id)).where(SupportMessage.customer_id == customer_id))
+                saved = update_db.get(SupportMessage, assistant_id)
+                if active and active.is_active and latest == assistant_id and saved and saved.body == reply.text:
+                    saved.body = ai_text[:2000]
+                    update_db.commit()
+    return result
 
 
 @app.get("/api/customer/chat-state")
@@ -1129,7 +1150,7 @@ def email_report(request: Request, data: ReportSendIn, db: Session = Depends(db_
     destination = reporting_config(db)
     if not destination["email"] or not email_ready(settings):
         raise HTTPException(status_code=409, detail="Configure the reporting email and SMTP provider first")
-    archive = export_zip(snapshot(db))
+    archive = export_zip(snapshot(db, external=True, full_customer_data=settings.external_full_customer_reports))
     if len(archive) > 10_000_000:
         raise HTTPException(status_code=413, detail="Report is too large for email. Download it privately instead.")
     try:

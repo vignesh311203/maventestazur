@@ -20,9 +20,13 @@ from app import main as m
 
 @pytest.fixture
 def client(monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    engine = create_engine(pg_url) if pg_url else create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    if pg_url:
+        m.Base.metadata.drop_all(engine)
     m.Base.metadata.create_all(engine)
     monkeypatch.setattr(m, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False))
+    monkeypatch.setattr(m, "engine", engine)
     monkeypatch.setattr(m.settings, "bootstrap_admin_email", "admin@example.com")
     monkeypatch.setattr(m.settings, "bootstrap_admin_password", "TestAdminPass123!")
     m.limiter.reset()
@@ -30,6 +34,8 @@ def client(monkeypatch):
         with TestClient(m.app) as c:
             yield c
     finally:
+        if pg_url:
+            m.Base.metadata.drop_all(engine)
         engine.dispose()
 
 def login(client, email, password):
@@ -471,7 +477,7 @@ def test_sheet_reporting_privacy_queue_and_retry(client, monkeypatch):
         def __init__(self, *args): pass
         def sync(self, data):
             assert set(data) == set(TABS)
-            assert data["Messages"][0]["body"] == "=1+1"
+            assert data["Messages"][0]["body"] == ""
             assert len(data["Customers"]) == 2
         def close(self): pass
     assert process_once(m, GoodMirror) == "synced"
@@ -859,3 +865,46 @@ def test_proxy_account_throttle_and_request_ids(client,monkeypatch):
     assert res.status_code==429 and res.headers["retry-after"]=="900"
     assert len(res.headers["x-request-id"])==32
     assert client.post("/api/auth/login",headers={"X-Real-IP":"203.0.113.50"},json={"email":"admin@example.com","password":"TestAdminPass123!"}).status_code==200
+
+
+def test_budget_redaction_preserves_money():
+    from app.ai_support import safe_question
+    assert "50000000" in safe_question("budget 50000000")
+    assert "45,00,000" in safe_question("price 45,00,000")
+    assert "9999999999" not in safe_question("call me at 9999999999")
+    assert "+91 9876543210" not in safe_question("phone +91 9876543210")
+
+
+def test_external_reporting_minimization(client):
+    from app.sheet_sync import snapshot
+    customer=register(client,"private-report@example.com")
+    client.post("/api/customer/messages",headers=customer,json={"body":"private customer message","client_id":"private-report-12345"})
+    with m.SessionLocal() as db:
+        full=snapshot(db)
+        external=snapshot(db,external=True)
+        assert full["Customers"][0]["email"]=="private-report@example.com"
+        assert external["Customers"][0]["email"]==""
+        assert external["Messages"][0]["body"]==""
+        assert snapshot(db,external=True,full_customer_data=True)["Messages"][0]["body"]=="private customer message"
+
+
+def test_ai_fallback_committed_before_provider(client,monkeypatch):
+    from pydantic import SecretStr
+    from sqlalchemy import select
+    from app import ai_support
+    customer=register(client,"ai-commit@example.com")
+    monkeypatch.setattr(m.settings,"ai_enabled",True)
+    monkeypatch.setattr(m.settings,"openai_api_key",SecretStr("test-key-not-real"))
+    calls=[]
+    def answer(*args):
+        with m.SessionLocal() as independent:
+            rows=list(independent.scalars(select(m.SupportMessage).order_by(m.SupportMessage.id)))
+            assert len(rows)==2 and rows[0].body=="How do loans work?"
+        calls.append(True)
+        return "Loan explanation."
+    monkeypatch.setattr(ai_support,"answer_question",answer)
+    body={"body":"How do loans work?","client_id":"ai-commit-test-1234","ai_consent":True}
+    assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
+    assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
+    assert len(calls)==1
+    assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="Loan explanation."
