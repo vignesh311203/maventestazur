@@ -223,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_sheets_outbox"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_sessions_locations"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -522,3 +522,119 @@ def test_sheets_mirror_uses_raw_deterministic_ranges():
     fake.headers["Leads"] = ["Unexpected header"]
     with pytest.raises(SheetsError, match="Unexpected header"):
         mirror.sync(data)
+
+
+def test_cookie_sessions_are_role_scoped_and_revocable(client):
+    admin_panel = {"X-Session-Panel": "admin"}
+    customer_panel = {"X-Session-Panel": "customer"}
+    response = client.post("/api/auth/login", headers=admin_panel, json={"email": "admin@example.com", "password": "TestAdminPass123!"})
+    assert response.status_code == 200, response.text
+    assert "access_token" not in response.json()
+    assert "httponly" in response.headers["set-cookie"].lower()
+    assert "samesite=strict" in response.headers["set-cookie"].lower()
+    assert client.get("/api/admin/users", headers=admin_panel).status_code == 200
+    assert client.get("/api/admin/users").status_code == 401
+    register_response = client.post("/api/auth/register", headers=customer_panel, json={"email":"cookiecustomer@example.com","full_name":"Cookie Customer","password":"CookiePass123456!"})
+    assert register_response.status_code == 201, register_response.text
+    assert client.get("/api/me", headers=customer_panel).json()["role"] == "customer"
+    assert client.get("/api/admin/users", headers=customer_panel).status_code == 403
+    assert client.get("/api/admin/users", headers=admin_panel).status_code == 200
+    assert client.post("/api/auth/login", headers=admin_panel, json={"email":"cookiecustomer@example.com","password":"CookiePass123456!"}).status_code == 403
+    assert client.post("/api/auth/logout", headers={**admin_panel,"Origin":"https://hostile.example"}).status_code == 403
+    old = client.cookies.get("metroestate_admin_session")
+    assert client.post("/api/auth/logout", headers=admin_panel).status_code == 200
+    assert client.get("/api/admin/users", headers={"Authorization":"Bearer "+old}).status_code == 401
+    assert client.get("/api/me", headers=customer_panel).status_code == 200
+
+
+def test_private_report_destinations_and_email_fallback(client, monkeypatch):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "reportdest@example.com")
+    assert client.get("/api/admin/reports/config", headers=customer).status_code == 403
+    payload = {"email":"reports@example.com","sheet_id":"https://docs.google.com/spreadsheets/d/test-spreadsheet-123/edit","current_password":"wrong"}
+    assert client.patch("/api/admin/reports/config", headers=admin, json=payload).status_code == 400
+    payload["current_password"] = "TestAdminPass123!"
+    assert client.patch("/api/admin/reports/config", headers=customer, json=payload).status_code == 403
+    assert client.patch("/api/admin/reports/config", headers=admin, json=payload).status_code == 200
+    config = client.get("/api/admin/reports/config", headers=admin).json()
+    assert config["email"] == "reports@example.com"
+    assert config["sheet_id"] == "test-spreadsheet-123"
+    assert "current_password" not in config
+    send = {"current_password":payload["current_password"],"authorized_recipient":True}
+    assert client.post("/api/admin/reports/email", headers=admin, json=send).status_code == 409
+    assert client.post("/api/admin/reports/email", headers=customer, json=send).status_code == 403
+    from app import report_mail
+    monkeypatch.setattr(report_mail, "email_ready", lambda settings: True)
+    received = []
+    monkeypatch.setattr(report_mail, "send_report", lambda settings, recipient, archive: received.append((recipient,archive)))
+    assert client.post("/api/admin/reports/email", headers=admin, json={**send,"authorized_recipient":False}).status_code == 422
+    assert client.post("/api/admin/reports/email", headers=admin, json=send).status_code == 200
+    assert received[0][0] == "reports@example.com" and received[0][1].startswith(b"PK")
+    payload.update(email="newreports@example.com",sheet_id="")
+    assert client.patch("/api/admin/reports/config", headers=admin, json=payload).status_code == 200
+    assert client.get("/api/admin/reports/config", headers=admin).json()["email"] == "newreports@example.com"
+
+
+def test_plot_location_validation_and_reporting(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    plot = {"project":"Location Test","plot_number":"L1","area_sqft":1200,"rate_per_sqft":3000,"location_label":"Test location, Karnataka","latitude":12.9,"longitude":77.6}
+    assert client.post("/api/plots", headers=admin, json={**plot,"longitude":None}).status_code == 422
+    assert client.post("/api/plots", headers=admin, json={**plot,"latitude":91}).status_code == 422
+    response = client.post("/api/plots", headers=admin, json=plot)
+    assert response.status_code == 201, response.text
+    item = next(x for x in client.get("/api/plots").json() if x["id"] == response.json()["id"])
+    assert item["latitude"] == 12.9 and item["longitude"] == 77.6
+    assert item["location_label"] == plot["location_label"]
+    from app.sheet_sync import snapshot
+    with m.SessionLocal() as db:
+        assert snapshot(db)["Locations"][0]["location_label"] == plot["location_label"]
+
+
+def test_optional_ai_adapter_redacts_and_handles_provider_failure():
+    from app.ai_support import answer_question, safe_question, eligible_question
+    assert not eligible_question("Book Site Visit")
+    assert eligible_question("Explain how a home loan works")
+    assert "example.com" not in safe_question("How do I update my email x@example.com?")
+    assert "9999999999" not in safe_question("Can you call 9999999999?")
+    calls = []
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"A home loan is repaid over time."}]}]}
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return Response()
+    answer = answer_question("How do loans work?", [{"project":"Public Plot"}], "test-key-not-real", "test-model", post=post)
+    assert answer == "A home loan is repaid over time."
+    assert calls[0]["json"]["store"] is False
+    assert "Public Plot" in calls[0]["json"]["input"]
+    class Failed:
+        status_code = 503
+    assert answer_question("How do loans work?", [], "test-key-not-real", "test-model", post=lambda *args,**kwargs:Failed()) is None
+
+
+def test_ai_consent_and_structured_flow_fallback(client, monkeypatch):
+    from pydantic import SecretStr
+    from app import ai_support
+    customer = register(client, "smart-ai@example.com")
+    monkeypatch.setattr(m.settings, "ai_enabled", True)
+    monkeypatch.setattr(m.settings, "openai_api_key", SecretStr("test-key-not-real"))
+    calls = []
+    def answer(body, inventory, key, model):
+        calls.append(body)
+        return "A verified general explanation."
+    monkeypatch.setattr(ai_support, "answer_question", answer)
+    def send(body, number, consent=False):
+        return client.post("/api/customer/messages", headers=customer, json={"body":body,"client_id":f"smart-ai-request-{number:03d}","ai_consent":consent})
+    assert send("How does a home loan work?", 1).status_code == 201
+    assert not calls
+    assert send("Explain how a home loan works", 2, True).status_code == 201
+    assert calls == ["Explain how a home loan works"]
+    assert client.get("/api/customer/messages", headers=customer).json()[-1]["body"] == "A verified general explanation."
+    assert send("Book Site Visit", 3, True).status_code == 201
+    assert len(calls) == 1
+    assert send("How does RERA work", 4, True).status_code == 201
+    assert len(calls) == 2
+    assert client.get("/api/customer/chat-state", headers=customer).json()["in_progress"] is True
+    assert send("Not sure yet", 5, True).status_code == 201
+    assert len(calls) == 2

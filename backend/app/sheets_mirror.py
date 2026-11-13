@@ -11,6 +11,7 @@ TABS = {
     "Referrals": ["id", "partner_id", "partner_name", "referred_name", "referred_phone", "status", "reward_amount"],
     "Partners": ["id", "name", "email", "is_active", "referrals_total", "referrals_approved", "rewards_approved", "rewards_paid"],
     "Customers": ["id", "name", "email", "is_active", "created_at"],
+    "Locations": ["id", "project", "plot_number", "location_label", "latitude", "longitude"],
 }
 API = "https://sheets.googleapis.com/v4/spreadsheets"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
