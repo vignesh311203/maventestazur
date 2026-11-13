@@ -223,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007_plot_finance"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_plot_media"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -713,3 +713,99 @@ def test_purchase_tds_is_a_withholding_not_an_extra_purchase_fee(client):
     assert high_guidance["tds_applicable"] is True
     assert high_guidance["tds_withheld_from_seller"]==50000
     assert high_guidance["seller_payment_after_tds"]==4450000
+
+
+def test_plot_public_photo_lifecycle_and_roles(client):
+    import base64
+    import io
+    from PIL import Image
+    from app.sheet_sync import snapshot
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "plot-photo-customer@example.com")
+    def image_data(color):
+        buf=io.BytesIO()
+        Image.new("RGB",(32,24),color).save(buf,format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+    values={"project":"Photo Enclave","plot_number":"P1","area_sqft":1200,"rate_per_sqft":3000,"description":"Public plot description","amenities":"Water and park","approval_details":"Verify documents","facing":"East","road_width_ft":40,"photo_data":image_data("green")}
+    assert client.post("/api/plots",headers=customer,json=values).status_code==403
+    assert client.post("/api/plots",headers=admin,json={**values,"photo_data":"not-a-photo"}).status_code==422
+    assert client.get("/api/plots").json()==[]
+    created=client.post("/api/plots",headers=admin,json=values)
+    assert created.status_code==201,created.text
+    plot=created.json()
+    assert plot["description"]==values["description"] and "photo_data" not in plot
+    path=plot["photo_url"]
+    assert path==f"/api/plots/{plot['id']}/photo"
+    photo=client.get(path)
+    assert photo.status_code==200 and photo.headers["content-type"]=="image/jpeg"
+    assert Image.open(io.BytesIO(photo.content)).size==(32,24)
+    update_path=f"/api/admin/plots/{plot['id']}"
+    assert client.patch(update_path,headers=customer,json={**values,"remove_photo":True,"photo_data":None}).status_code==403
+    edited={**values,"photo_data":image_data("red"),"description":"Updated plot details"}
+    assert client.patch(update_path,headers=admin,json=edited).status_code==200
+    assert client.get(path).content!=photo.content
+    assert client.patch(update_path,headers=admin,json={**edited,"photo_data":None}).status_code==200
+    assert client.get(path).status_code==200
+    with m.SessionLocal() as db:
+        assert snapshot(db)["Plot details"][0]["has_photo"] is True
+        assert snapshot(db)["Plot details"][0]["description"]=="Updated plot details"
+    assert client.patch(update_path,headers=admin,json={**edited,"photo_data":None,"remove_photo":True}).status_code==200
+    assert client.get(path).status_code==404
+    assert client.get("/api/plots").json()[0]["photo_url"] is None
+    assert client.post("/api/plots",headers=admin,json={**values,"photo_data":"A"*3000001}).status_code==413
+
+
+def test_read_only_advisor_tools_and_privacy():
+    from app.agent_ai import converse, build_messages, emi_amount, run_tool
+    import copy
+    history=[{"sender":"admin","body":"private team note"},{"sender":"customer","body":"My email is test@example.com"},{"sender":"assistant","body":"Contact test@example.com"},{"sender":"customer","body":"What fits 40 lakh?"}]
+    messages=build_messages(history)
+    assert "example.com" not in str(messages) and "private team note" not in str(messages)
+    assert emi_amount(1000000,0,100)["monthly_emi_inr"]==10000
+    assert "error" in run_tool("calculate_emi",{"principal_inr":100,"annual_rate_percent":3,"months":2.5},{})
+    assert "error" in run_tool("delete_everything",{}, {})
+    calls=[]
+    class R:
+        status_code=200
+        def __init__(self,data):self.data=data
+        def json(self):return self.data
+    def post(url,**kw):
+        calls.append(copy.deepcopy(kw["json"]))
+        if len(calls)==1:
+            return R({"stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"search_plots","input":{"max_budget_inr":4000000}}]})
+        return R({"stop_reason":"end_turn","content":[{"type":"text","text":"A plot fits your budget."}]})
+    result=converse(history,{"search_plots":lambda **args:{"count":1,"args":args}},"test-key-not-real","test-model",post=post)
+    assert result=="A plot fits your budget."
+    assert calls[1]["messages"][-1]["content"][0]["tool_use_id"]=="t1"
+    assert converse(history,{},"test-key-not-real","test-model",post=lambda *a,**k:R({"stop_reason":"max_tokens"})) is None
+
+
+def test_advisor_consent_and_customer_isolation(client,monkeypatch):
+    from pydantic import SecretStr
+    from app import agent_ai
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    customer=register(client,"advisor-test@example.com")
+    other=register(client,"advisor-other@example.com")
+    client.post("/api/customer/messages",headers=other,json={"body":"Private other customer","client_id":"other-advisor-test-001"})
+    client.post("/api/plots",headers=admin,json={"project":"Available Enclave","plot_number":"1","area_sqft":1000,"rate_per_sqft":3000})
+    client.post("/api/plots",headers=admin,json={"project":"Sold Enclave","plot_number":"2","area_sqft":1000,"rate_per_sqft":3000,"status":"sold"})
+    monkeypatch.setattr(m.settings,"ai_enabled",True)
+    monkeypatch.setattr(m.settings,"ai_provider","anthropic")
+    monkeypatch.setattr(m.settings,"anthropic_api_key",SecretStr("test-key-not-real"))
+    seen=[]
+    def fake(history,handlers,key,model,name):
+        seen.append(history)
+        assert handlers["search_plots"](max_budget_inr=4000000)["count"]==1
+        assert "error" in handlers["plot_base_price"]("Sold Enclave","2")
+        return "A plot fits your budget."
+    monkeypatch.setattr(agent_ai,"converse",fake)
+    assert client.get("/api/customer/chat-state",headers=customer).json()["ai_available"]
+    def send(text,n,consent):
+        return client.post("/api/customer/messages",headers=customer,json={"body":text,"client_id":f"advisor-test-message-{n:03d}","ai_consent":consent})
+    assert send("I have a 40 lakh budget",1,False).status_code==201
+    assert not seen
+    assert send("Which plot is available?",2,True).status_code==201
+    assert len(seen)==1 and "Private other customer" not in str(seen[0])
+    assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="A plot fits your budget."
+    assert send("Book Site Visit",3,True).status_code==201
+    assert len(seen)==1

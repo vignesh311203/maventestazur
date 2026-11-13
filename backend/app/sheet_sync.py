@@ -15,6 +15,7 @@ def iso(value):
 
 def snapshot(db):
     from . import main as m
+    photo_ids = set(db.scalars(select(m.PlotPhoto.plot_id)))
     users = {u.id: u for u in db.scalars(select(m.User).order_by(m.User.id))}
     referrals = list(db.scalars(select(m.Referral).order_by(m.Referral.id)))
     partner_stats = {}
@@ -35,6 +36,7 @@ def snapshot(db):
         "Referrals": [{"id": x.id, "partner_id": x.referrer_id, "partner_name": name(x.referrer_id), "referred_name": x.referred_name, "referred_phone": x.referred_phone, "status": x.status, "reward_amount": x.reward_amount} for x in referrals],
         "Partners": [{"id": u.id, "name": u.full_name, "email": u.email, "is_active": u.is_active, "referrals_total": partner_stats.get(u.id, [0, 0, 0, 0])[0], "referrals_approved": partner_stats.get(u.id, [0, 0, 0, 0])[1], "rewards_approved": partner_stats.get(u.id, [0, 0, 0, 0])[2], "rewards_paid": partner_stats.get(u.id, [0, 0, 0, 0])[3]} for u in users.values() if u.role == "partner"],
         "PlotFinance": [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent, "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft} for p in db.scalars(select(m.Plot).order_by(m.Plot.id))],
+        "Plot details": [{"id":p.id,"project":p.project,"plot_number":p.plot_number,"description":p.description,"amenities":p.amenities,"approval_details":p.approval_details,"facing":p.facing,"road_width_ft":p.road_width_ft,"has_photo":p.id in photo_ids} for p in db.scalars(select(m.Plot).order_by(m.Plot.id))],
         "Locations": [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude} for p in db.scalars(select(m.Plot).order_by(m.Plot.id))],
         "Customers": [{"id": u.id, "name": u.full_name, "email": u.email, "is_active": u.is_active, "created_at": iso(u.created_at)} for u in users.values() if u.role == "customer"],
     }
