@@ -686,3 +686,30 @@ def test_finance_construction_and_plot_metadata(client):
     from app.sheet_sync import snapshot
     with m.SessionLocal() as db:
         assert snapshot(db)["PlotFinance"][0]["corner_premium_percent"]==5
+
+
+def test_purchase_tds_is_a_withholding_not_an_extra_purchase_fee(client):
+    values={"area_sqft":1000,"rate_per_sqft":6000,"corner_plot":False,"guidance_value":6000000,"seller_resident_india":True}
+    response=client.post("/api/finance/purchase",json=values)
+    assert response.status_code==200,response.text
+    data=response.json()
+    assert data["tds_applicable"] is True
+    assert data["tds_review_required"] is False
+    assert data["tds_withheld_from_seller"]==60000
+    assert data["seller_payment_after_tds"]==5940000
+    assert data["purchase_total"]==6456000
+    pending=client.post("/api/finance/purchase",json={**values,"seller_resident_india":None}).json()
+    assert pending["tds_review_required"] is True
+    assert pending["indicative_tds_if_resident"]==60000
+    assert pending["tds_withheld_from_seller"]==0
+    assert pending["purchase_total"]==data["purchase_total"]
+    exempt=client.post("/api/finance/purchase",json={**values,"rural_agricultural_land":True}).json()
+    assert exempt["tds_applicable"] is False
+    assert exempt["tds_withheld_from_seller"]==0
+    under=client.post("/api/finance/purchase",json={**values,"area_sqft":800,"rate_per_sqft":5000,"guidance_value":4000000}).json()
+    assert under["tds_applicable"] is False
+    assert under["tds_review_required"] is False
+    high_guidance=client.post("/api/finance/purchase",json={**values,"area_sqft":900,"rate_per_sqft":5000,"guidance_value":5000000}).json()
+    assert high_guidance["tds_applicable"] is True
+    assert high_guidance["tds_withheld_from_seller"]==50000
+    assert high_guidance["seller_payment_after_tds"]==4450000

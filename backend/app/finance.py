@@ -28,6 +28,8 @@ class PurchaseIn(BaseModel):
     govt_other: Decimal = Field(default=D(0), ge=0, le=10**9, decimal_places=2)
     legal_charges: Decimal = Field(default=D(0), ge=0, le=10**9, decimal_places=2)
     developer_charges: Decimal = Field(default=D(0), ge=0, le=10**9, decimal_places=2)
+    seller_resident_india: bool | None = None
+    rural_agricultural_land: bool = False
 
     @model_validator(mode="after")
     def corner_rule(self):
@@ -49,6 +51,11 @@ def purchase(data: PurchaseIn):
     cess = pct(stamp, data.cess_on_duty_percent)
     surcharge = pct(stamp, data.surcharge_on_duty_percent)
     government = money(stamp + registration + cess + surcharge + data.govt_other)
+    threshold = D(5_000_000)
+    tds_review_required = max(sale, basis) >= threshold and data.seller_resident_india is None and not data.rural_agricultural_land
+    tds_applicable = max(sale, basis) >= threshold and data.seller_resident_india is True and not data.rural_agricultural_land
+    tds_basis = max(sale, basis)
+    tds_withheld = pct(tds_basis, D(1)) if tds_applicable else D(0)
     return {
         "base_price": base, "corner_premium": premium, "sale_price": sale,
         "guidance_value": data.guidance_value, "assessment_basis": basis,
@@ -57,8 +64,13 @@ def purchase(data: PurchaseIn):
         "government_total": government, "legal_charges": data.legal_charges,
         "developer_charges": data.developer_charges,
         "purchase_total": money(sale + government + data.legal_charges + data.developer_charges),
+        "tds_applicable": tds_applicable,
+        "tds_review_required": tds_review_required,
+        "tds_withheld_from_seller": tds_withheld,
+        "indicative_tds_if_resident": pct(tds_basis, D(1)) if tds_review_required else D(0),
+        "seller_payment_after_tds": money(sale - tds_withheld) if tds_applicable else None,
         "provisional": data.guidance_value is None or data.corner_plot is None or (data.corner_plot and data.corner_premium_percent is None),
-        "notice": "Illustrative Karnataka ordinary sale deed estimate. Confirm assessed value, deed, local surcharge, concessions and exact payable charges in Kaveri. Guidance value is a valuation, not an additional payment. No tax or bank approval is implied."
+        "notice": "Illustrative Karnataka ordinary sale deed estimate. Confirm assessed value, deed, local surcharge, concessions and exact payable charges in Kaveri. Guidance value is a valuation, not an additional payment. Buyer TDS, if applicable, is withheld from the seller payment and deposited with the tax authority, not added on top of the sale price. Seller residence and land classification need verification. No tax or bank approval is implied."
     }
 
 class ConstructionIn(BaseModel):
