@@ -1,6 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from .chatbot import respond, MENU
+from .finance import router as finance_router
 from enum import Enum
 from typing import Generator
 from math import expm1, log1p
@@ -131,6 +132,11 @@ class Plot(Base):
     location_label: Mapped[str] = mapped_column(String(255), default="", server_default="")
     latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    corner_plot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    corner_premium_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    guidance_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
+    depth_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 class Referral(Base):
     __tablename__ = "referrals"
@@ -173,6 +179,7 @@ _dummy_password_hash = password_hash.hash(secrets.token_urlsafe(32))
 bearer = HTTPBearer(auto_error=False)
 limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
 app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
+app.include_router(finance_router)
 app.state.limiter = limiter
 if settings.app_env == "production":
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in settings.trusted_hosts.split(",") if host.strip()])
@@ -251,11 +258,22 @@ class PlotIn(BaseModel):
     location_label: str = Field(default="", max_length=255)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+    corner_plot: bool | None = None
+    corner_premium_percent: float | None = Field(default=None, ge=0, le=100)
+    guidance_value: float | None = Field(default=None, gt=0, le=1e12)
+    width_ft: float | None = Field(default=None, gt=0, le=100000)
+    depth_ft: float | None = Field(default=None, gt=0, le=100000)
 
     @model_validator(mode="after")
     def validate_location(self):
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError("Provide both latitude and longitude, or leave both blank")
+        if (self.width_ft is None) != (self.depth_ft is None):
+            raise ValueError("Provide both plot dimensions, or leave both blank")
+        if self.width_ft is not None and abs(self.width_ft * self.depth_ft - self.area_sqft) > self.area_sqft * 0.05:
+            raise ValueError("Rectangular dimensions must agree with the listed area within 5%")
+        if self.corner_plot is not True and self.corner_premium_percent not in (None, 0):
+            raise ValueError("Set corner plot before specifying a premium")
         return self
 class ReferralIn(BaseModel):
     referred_name: str = Field(min_length=2, max_length=160)
@@ -482,7 +500,7 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
 
 @app.get("/api/plots")
 def list_plots(db: Session = Depends(db_session)):
-    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent, "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
 
 @app.post("/api/plots", status_code=201)
 def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
@@ -541,7 +559,7 @@ class AdminAudit(Base):
     target: Mapped[str] = mapped_column(String(160), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-DEFAULT_SETTINGS = {"registration_percent":"5.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
+DEFAULT_SETTINGS = {"registration_percent":"2.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
 
 class AdminUserIn(BaseModel):
     email: EmailStr
