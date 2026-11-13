@@ -959,7 +959,7 @@ class SheetSyncStatus(Base):
 
 @event.listens_for(Session, "before_flush")
 def queue_reporting_changes(db, flush_context, instances):
-    watched = (Lead, SupportMessage, Plot, Referral, User)
+    watched = (Lead, SupportMessage, Plot, PlotPhoto, Referral, User)
     if any(isinstance(obj, watched) for obj in db.new.union(db.deleted)) or any(isinstance(obj, watched) and db.is_modified(obj, include_collections=False) for obj in db.dirty):
         db.add(SheetOutbox())
 
