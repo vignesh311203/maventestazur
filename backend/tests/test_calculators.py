@@ -223,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007_plot_finance"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_property_media"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -713,3 +713,46 @@ def test_purchase_tds_is_a_withholding_not_an_extra_purchase_fee(client):
     assert high_guidance["tds_applicable"] is True
     assert high_guidance["tds_withheld_from_seller"]==50000
     assert high_guidance["seller_payment_after_tds"]==4450000
+
+
+def test_property_photo_and_listing_details(client):
+    import base64
+    import io
+    from PIL import Image
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "photo-customer@example.com")
+    image = io.BytesIO()
+    Image.new("RGB", (64, 48), (20, 120, 40)).save(image, format="PNG")
+    photo = base64.b64encode(image.getvalue()).decode()
+    payload = {"project": "Photo Test", "plot_number": "P1", "area_sqft": 1200, "rate_per_sqft": 3500,
+               "description": "Example listing", "amenities": "Park, water", "approvals": "Test reference",
+               "possession": "On confirmation", "facing": "East", "road_width_ft": 40, "photo_data": photo}
+    assert client.post("/api/plots", headers=customer, json=payload).status_code == 403
+    assert client.post("/api/plots", headers=admin, json={**payload,"photo_data":"bad image"}).status_code == 422
+    assert client.post("/api/plots", headers=admin, json={**payload,"remove_photo":True}).status_code == 422
+    response = client.post("/api/plots", headers=admin, json=payload)
+    assert response.status_code == 201, response.text
+    plot = response.json()
+    assert "photo_data" not in plot
+    assert plot["description"] == payload["description"]
+    assert plot["photo_url"]
+    public = client.get("/api/plots").json()[0]
+    assert public["amenities"] == "Park, water" and public["photo_url"] == plot["photo_url"]
+    photo_response = client.get(plot["photo_url"])
+    assert photo_response.status_code == 200
+    assert photo_response.headers["content-type"] == "image/jpeg"
+    assert Image.open(io.BytesIO(photo_response.content)).format == "JPEG"
+    url = f"/api/admin/plots/{plot['id']}"
+    update = {**payload, "description":"Updated listing"}
+    update.pop("photo_data")
+    assert client.patch(url,headers=customer,json=update).status_code == 403
+    changed = client.patch(url,headers=admin,json=update)
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["photo_url"] == plot["photo_url"]
+    from app.sheet_sync import snapshot
+    with m.SessionLocal() as db:
+        assert snapshot(db)["PropertyDetails"][0]["description"] == "Updated listing"
+    removed = client.patch(url,headers=admin,json={**update,"remove_photo":True})
+    assert removed.status_code == 200
+    assert removed.json()["photo_url"] is None
+    assert client.get(plot["photo_url"]).status_code == 404

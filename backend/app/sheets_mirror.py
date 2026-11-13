@@ -11,6 +11,7 @@ TABS = {
     "Referrals": ["id", "partner_id", "partner_name", "referred_name", "referred_phone", "status", "reward_amount"],
     "Partners": ["id", "name", "email", "is_active", "referrals_total", "referrals_approved", "rewards_approved", "rewards_paid"],
     "Customers": ["id", "name", "email", "is_active", "created_at"],
+    "PropertyDetails": ["id", "project", "plot_number", "description", "amenities", "approvals", "possession", "facing", "road_width_ft", "has_photo"],
     "PlotFinance": ["id", "project", "plot_number", "corner_plot", "corner_premium_percent", "guidance_value", "width_ft", "depth_ft"],
     "Locations": ["id", "project", "plot_number", "location_label", "latitude", "longitude"],
 }

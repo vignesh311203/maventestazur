@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from .chatbot import respond, MENU
 from .finance import router as finance_router
+from .property_media import normalize_photo
 from enum import Enum
 from typing import Generator
 from math import expm1, log1p
@@ -20,7 +21,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -137,6 +138,18 @@ class Plot(Base):
     guidance_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     width_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
     depth_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
+    amenities: Mapped[str] = mapped_column(Text, default="", server_default="")
+    approvals: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    possession: Mapped[str] = mapped_column(String(120), default="", server_default="")
+    facing: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    road_width_ft: Mapped[float | None] = mapped_column(Float, nullable=True)
+    photo_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+class PlotPhoto(Base):
+    __tablename__ = "plot_photos"
+    plot_id: Mapped[int] = mapped_column(ForeignKey("plots.id", ondelete="CASCADE"), primary_key=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
 class Referral(Base):
     __tablename__ = "referrals"
@@ -263,9 +276,19 @@ class PlotIn(BaseModel):
     guidance_value: float | None = Field(default=None, gt=0, le=1e12)
     width_ft: float | None = Field(default=None, gt=0, le=100000)
     depth_ft: float | None = Field(default=None, gt=0, le=100000)
+    description: str = Field(default="", max_length=2000)
+    amenities: str = Field(default="", max_length=1000)
+    approvals: str = Field(default="", max_length=500)
+    possession: str = Field(default="", max_length=120)
+    facing: str = Field(default="", pattern="^(|North|South|East|West|North-East|North-West|South-East|South-West)$")
+    road_width_ft: float | None = Field(default=None, gt=0, le=500)
+    photo_data: str | None = Field(default=None, max_length=2796204)
+    remove_photo: bool = False
 
     @model_validator(mode="after")
     def validate_location(self):
+        if self.photo_data is not None and self.remove_photo:
+            raise ValueError("Choose upload or remove, not both")
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError("Provide both latitude and longitude, or leave both blank")
         if (self.width_ft is None) != (self.depth_ft is None):
@@ -498,14 +521,54 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
     lead.status = new_status; db.commit()
     return {"id": lead.id, "status": lead.status}
 
+def plot_view(p: Plot):
+    fields = ("id", "project", "plot_number", "area_sqft", "rate_per_sqft", "status", "x", "y", "location_label", "latitude", "longitude", "corner_plot", "corner_premium_percent", "guidance_value", "width_ft", "depth_ft", "description", "amenities", "approvals", "possession", "facing", "road_width_ft")
+    return {**{key: getattr(p, key) for key in fields}, "photo_url": f"/api/plots/{p.id}/photo?v={p.photo_version}" if p.photo_version else None}
+
+def prepared_photo(data: PlotIn):
+    if data.photo_data is None:
+        return None
+    try:
+        return normalize_photo(data.photo_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+def apply_plot_photo(db: Session, plot: Plot, data: PlotIn, photo: bytes | None):
+    if photo is not None:
+        existing = db.get(PlotPhoto, plot.id)
+        if existing:
+            existing.content = photo
+        else:
+            db.add(PlotPhoto(plot_id=plot.id, content=photo))
+        plot.photo_version = hashlib.sha256(photo).hexdigest()
+    elif data.remove_photo:
+        existing = db.get(PlotPhoto, plot.id)
+        if existing:
+            db.delete(existing)
+        plot.photo_version = None
+
 @app.get("/api/plots")
 def list_plots(db: Session = Depends(db_session)):
-    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent, "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+    return [plot_view(p) for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+
+@app.get("/api/plots/{plot_id}/photo")
+def public_plot_photo(plot_id: int, db: Session = Depends(db_session)):
+    photo = db.get(PlotPhoto, plot_id)
+    if photo is None or db.get(Plot, plot_id) is None:
+        raise HTTPException(status_code=404, detail="Property photo not found")
+    return Response(photo.content, media_type="image/jpeg", headers={"Content-Disposition": "inline"})
 
 @app.post("/api/plots", status_code=201)
-def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
-    plot = Plot(**data.model_dump()); db.add(plot); db.commit(); db.refresh(plot)
-    return {"id": plot.id, **data.model_dump()}
+@limiter.limit("30/minute")
+def add_plot(request: Request, data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    photo = prepared_photo(data)
+    plot = Plot(**data.model_dump(exclude={"photo_data", "remove_photo"}))
+    db.add(plot)
+    db.flush()
+    apply_plot_photo(db, plot, data, photo)
+    db.commit()
+    db.refresh(plot)
+    return plot_view(plot)
 
 @app.post("/api/partners/referrals", status_code=201)
 def create_referral(data: ReferralIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.partner, Role.admin))):
@@ -648,13 +711,16 @@ def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=D
     return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
 
 @app.patch("/api/admin/plots/{plot_id}")
-def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
+@limiter.limit("30/minute")
+def admin_update_plot(request: Request, plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     item=db.get(Plot,plot_id)
     if not item: raise HTTPException(status_code=404,detail="Plot not found")
-    for key,value in data.model_dump().items(): setattr(item,key,value)
+    photo = prepared_photo(data)
+    for key,value in data.model_dump(exclude={"photo_data", "remove_photo"}).items(): setattr(item,key,value)
+    apply_plot_photo(db, item, data, photo)
     db.commit()
     write_admin_audit(db,user,"plot.updated",str(item.id))
-    return {"id":item.id,**data.model_dump()}
+    return plot_view(item)
 
 @app.get("/api/admin/audit")
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
