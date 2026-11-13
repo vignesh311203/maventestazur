@@ -223,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_sessions_locations"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007_plot_finance"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -638,3 +638,51 @@ def test_ai_consent_and_structured_flow_fallback(client, monkeypatch):
     assert client.get("/api/customer/chat-state", headers=customer).json()["in_progress"] is True
     assert send("Not sure yet", 5, True).status_code == 201
     assert len(calls) == 2
+
+
+def test_finance_purchase_guidance_corner_and_government_charges(client):
+    data = {"area_sqft":1200,"rate_per_sqft":3500,"corner_plot":True,"corner_premium_percent":5,"guidance_value":5000001,"govt_other":1000,"legal_charges":5000,"developer_charges":10000}
+    res = client.post("/api/finance/purchase", json=data)
+    assert res.status_code == 200, res.text
+    x = res.json()
+    assert x["base_price"] == 4200000
+    assert x["corner_premium"] == 210000 and x["sale_price"] == 4410000
+    assert x["assessment_basis"] == 5000001 and x["registration_basis"] == 5001000
+    assert x["stamp_duty"] == 250000.05 and x["registration_fee"] == 100020
+    assert x["cess"] == 25000.01 and x["surcharge"] == 5000
+    assert x["government_total"] == 381020.06 and x["purchase_total"] == 4806020.06
+    assert not x["provisional"]
+    assert client.post("/api/finance/purchase", json={**data,"corner_plot":False}).status_code == 422
+    assert client.post("/api/finance/purchase", json={"area_sqft":1200,"rate_per_sqft":3500}).json()["provisional"] is True
+
+def test_finance_loan_reconciles_amortization_and_stage_interest(client):
+    from decimal import Decimal
+    body={"loan_type":"construction","project_cost":3000000,"loan_amount":2400000,"annual_rate_percent":8.5,"months":240,"disbursed_amount":600000,"upfront_fees":10000}
+    res=client.post("/api/finance/loan",json=body)
+    assert res.status_code==200, res.text
+    x=res.json()
+    assert x["own_contribution"]==600000 and x["cash_required"]==610000
+    assert x["pre_emi_monthly"]==4250
+    assert x["schedule"][-1]["balance"]==0 and len(x["schedule"])==240
+    d=lambda value: Decimal(str(value))
+    assert sum(d(row["principal"]) for row in x["schedule"])==d(x["loan_amount"])
+    assert sum(d(row["interest"]) for row in x["schedule"])==d(x["total_interest"])
+    assert sum(d(row["payment"]) for row in x["schedule"])==d(x["total_repayment"])
+    assert client.post("/api/finance/loan",json={**body,"loan_amount":4000000}).status_code==422
+    assert client.post("/api/finance/loan",json={**body,"disbursed_amount":2500000}).status_code==422
+    zero=client.post("/api/finance/loan",json={"loan_type":"plot","project_cost":1000,"loan_amount":1000,"annual_rate_percent":0,"months":3}).json()
+    assert zero["monthly_emi"]==333.33 and zero["final_payment"]==333.34 and zero["total_interest"]==0
+
+def test_finance_construction_and_plot_metadata(client):
+    c=client.post("/api/finance/construction",json={"built_area_sqft":1500,"build_rate_per_sqft":2000,"contingency_percent":10,"professional_fees":50000,"approval_fees":25000}).json()
+    assert c["construction_total"]==3375000
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    plot={"project":"Finance Test","plot_number":"C1","area_sqft":1200,"rate_per_sqft":3500,"corner_plot":True,"corner_premium_percent":5,"guidance_value":5000000,"width_ft":30,"depth_ft":40}
+    assert client.post("/api/plots",json=plot).status_code==401
+    assert client.post("/api/plots",json={**plot,"depth_ft":50},headers=admin).status_code==422
+    assert client.post("/api/plots",json=plot,headers=admin).status_code==201
+    item=client.get("/api/plots").json()[0]
+    assert item["corner_plot"] is True and item["guidance_value"]==5000000 and item["width_ft"]==30
+    from app.sheet_sync import snapshot
+    with m.SessionLocal() as db:
+        assert snapshot(db)["PlotFinance"][0]["corner_premium_percent"]==5

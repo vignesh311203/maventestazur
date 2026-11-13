@@ -24,7 +24,8 @@ try{
   assert.equal(await page.getByRole("heading",{name:"Administrator sign in"}).count(),0);
   console.log("PASS public mobile homepage and separate login");
   await page.getByRole("heading",{name:"Home loan EMI"}).waitFor();await page.getByRole("heading",{name:"Plot cost estimator"}).waitFor();await page.getByRole("heading",{name:"Property growth projection"}).waitFor();
-  console.log("PASS all public calculator views");
+  await page.getByLabel("Sale rate per sq ft (₹)",{exact:true}).fill("3500");await page.getByLabel("Government guidance value (₹, whole plot)",{exact:true}).fill("5000000");await page.getByRole("button",{name:"Calculate full plot cost",exact:true}).click();await page.getByText("Total government charges",{exact:true}).waitFor();await page.getByLabel("Construction rate per sq ft (₹)",{exact:true}).fill("2000");await page.getByRole("button",{name:"Calculate construction cost",exact:true}).click();await page.getByRole("heading",{name:"Combined property project budget"}).waitFor();await page.getByRole("button",{name:"Use estimated purchase total",exact:true}).click();await page.getByLabel("Sanctioned loan amount (₹)",{exact:true}).filter({visible:true}).fill("3000000");await page.getByRole("button",{name:"Calculate plot EMI",exact:true}).click();await page.getByText("Total loan repayment",{exact:true}).waitFor();
+  console.log("PASS full purchase, construction and amortization calculators");
   await page.getByLabel("Full name",{exact:true}).fill(name);await page.getByLabel("Phone number",{exact:true}).fill("9999999999");await page.getByLabel("Property interest",{exact:true}).fill("Test residential plot");await page.getByRole("checkbox").check();
   const guest=page.waitForResponse(r=>r.url().endsWith("/api/public/enquiries")&&r.request().method()==="POST");
   await page.getByRole("button",{name:"Send enquiry",exact:true}).click();assert.equal((await guest).status(),201);
