@@ -7,6 +7,8 @@ from math import expm1, log1p
 import jwt
 import hashlib
 import hmac
+import secrets
+from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -14,9 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
-from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -34,6 +36,14 @@ class Settings(BaseSettings):
     trusted_hosts: str = "localhost,127.0.0.1,testserver"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
+    ai_enabled: bool = False
+    openai_api_key: SecretStr = SecretStr("")
+    openai_model: str = "gpt-5.6-terra"
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: SecretStr = SecretStr("")
+    smtp_from_email: str = ""
     google_sheets_enabled: bool = False
     google_sheet_id: str = ""
     google_service_account_json: SecretStr = SecretStr("")
@@ -75,6 +85,20 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ReportDestination(Base):
+    __tablename__ = "report_destinations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), default="")
+    sheet_id: Mapped[str] = mapped_column(String(200), default="")
+
+
 class Lead(Base):
     __tablename__ = "leads"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -103,6 +127,9 @@ class Plot(Base):
     status: Mapped[str] = mapped_column(String(20), default="available")
     x: Mapped[float] = mapped_column(Float, default=0)
     y: Mapped[float] = mapped_column(Float, default=0)
+    location_label: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 class Referral(Base):
     __tablename__ = "referrals"
@@ -141,6 +168,7 @@ class ChatState(Base):
 
 
 password_hash = PasswordHash.recommended()
+_dummy_password_hash = password_hash.hash(secrets.token_urlsafe(32))
 bearer = HTTPBearer(auto_error=False)
 limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
 app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
@@ -152,7 +180,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(RequestValidationError)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]})
-app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-Session-Panel"])
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -219,6 +247,15 @@ class PlotIn(BaseModel):
     status: str = Field(default="available", pattern="^(available|reserved|sold)$")
     x: float = Field(default=0, ge=0, le=10000)
     y: float = Field(default=0, ge=0, le=10000)
+    location_label: str = Field(default="", max_length=255)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def validate_location(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("Provide both latitude and longitude, or leave both blank")
+        return self
 class ReferralIn(BaseModel):
     referred_name: str = Field(min_length=2, max_length=160)
     referred_phone: str = Field(min_length=7, max_length=30)
@@ -232,21 +269,77 @@ class ReviewIn(BaseModel):
 def password_version(user: User) -> str:
     return hmac.new(settings.app_secret_key.encode(), user.password_hash.encode(), hashlib.sha256).hexdigest()
 
-def issue_token(user: User) -> str:
-    now = datetime.now(timezone.utc)
-    return jwt.encode({"sub": str(user.id), "role": user.role, "pv": password_version(user), "iat": now, "exp": now + timedelta(minutes=settings.access_token_minutes)}, settings.app_secret_key, algorithm="HS256")
+PANEL_ROLES = {"admin", "customer", "partner"}
 
-def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(db_session)) -> User:
-    if not credentials: raise HTTPException(status_code=401, detail="Authentication required")
+def browser_panel(request: Request) -> str | None:
+    panel = request.headers.get("X-Session-Panel")
+    if panel is None:
+        return None
+    if panel not in PANEL_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid session panel")
+    origin = request.headers.get("Origin")
+    if origin and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        allowed = {v.strip().rstrip("/") for v in settings.cors_origins.split(",") if v.strip()}
+        parsed = urlsplit(origin)
+        same_host = parsed.netloc == request.headers.get("host") and parsed.scheme in ({"https"} if settings.app_env == "production" else {"http", "https"})
+        if origin.rstrip("/") not in allowed and not same_host:
+            raise HTTPException(status_code=403, detail="Untrusted request origin")
+    return panel
+
+def cookie_name(panel: str) -> str:
+    return "metroestate_" + panel + "_session"
+
+def digest_session(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+def issue_token(user: User, db: Session) -> str:
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=settings.access_token_minutes)
+    jti = secrets.token_urlsafe(32)
+    db.execute(delete(AuthSession).where(AuthSession.expires_at <= now))
+    db.add(AuthSession(digest=digest_session(jti), user_id=user.id, expires_at=expires))
+    db.commit()
+    return jwt.encode({"sub": str(user.id), "role": user.role, "pv": password_version(user), "jti": jti, "iat": now, "exp": expires}, settings.app_secret_key, algorithm="HS256")
+
+def authentication_result(user: User, db: Session, request: Request, response: Response):
+    panel = browser_panel(request)
+    if panel and panel != user.role:
+        raise HTTPException(status_code=403, detail="This account cannot access this panel. Use the appropriate account page.")
+    token = issue_token(user, db)
+    profile = {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}
+    if panel:
+        prior = request.cookies.get(cookie_name(panel))
+        if prior:
+            try:
+                payload = jwt.decode(prior, settings.app_secret_key, algorithms=["HS256"], options={"require": ["jti", "exp", "sub"]})
+                db.execute(delete(AuthSession).where(AuthSession.digest == digest_session(payload["jti"]), AuthSession.user_id == int(payload["sub"])))
+                db.commit()
+            except (jwt.InvalidTokenError, ValueError, TypeError, KeyError):
+                pass
+        response.set_cookie(cookie_name(panel), token, httponly=True, secure=settings.app_env == "production", samesite="strict", path="/api", max_age=settings.access_token_minutes * 60)
+        return {"user": profile, "session": "cookie"}
+    return {"access_token": token, "token_type": "bearer", "user": profile}
+
+def current_user(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(db_session)) -> User:
+    panel = browser_panel(request)
+    token = credentials.credentials if credentials else request.cookies.get(cookie_name(panel)) if panel else None
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        payload = jwt.decode(credentials.credentials, settings.app_secret_key, algorithms=["HS256"], options={"require": ["sub", "iat", "exp"]})
+        payload = jwt.decode(token, settings.app_secret_key, algorithms=["HS256"], options={"require": ["sub", "iat", "exp", "jti"]})
         user_id = int(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        digest = digest_session(payload["jti"])
+    except (jwt.InvalidTokenError, KeyError, ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    session = db.scalar(select(AuthSession).where(AuthSession.digest == digest, AuthSession.user_id == user_id, AuthSession.expires_at > datetime.now(timezone.utc)))
     user = db.get(User, user_id)
-    if not user or not user.is_active: raise HTTPException(status_code=401, detail="Account unavailable")
-    if not hmac.compare_digest(str(payload.get("pv", "")), password_version(user)):
+    if not session or not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Session unavailable; please sign in again")
+    if not hmac.compare_digest(str(payload.get("pv", "")), password_version(user)) or payload.get("role") != user.role:
         raise HTTPException(status_code=401, detail="Session expired; please sign in again")
+    if panel and panel != user.role:
+        raise HTTPException(status_code=403, detail="This account cannot access this panel")
+    request.state.auth_session_digest = digest
     return user
 
 def require_roles(*roles: Role):
@@ -268,7 +361,9 @@ def ready(db: Session = Depends(db_session)):
 
 @app.post("/api/auth/register", status_code=201)
 @limiter.limit("5/minute")
-def register(data: RegisterIn, request: Request, db: Session = Depends(db_session)):
+def register(data: RegisterIn, request: Request, response: Response, db: Session = Depends(db_session)):
+    if browser_panel(request) not in {None, "customer"}:
+        raise HTTPException(status_code=403, detail="Registration is for customers only")
     if db.scalar(select(User).where(User.email == data.email.lower())): raise HTTPException(status_code=409, detail="Email already registered")
     user = User(email=data.email.lower(), full_name=data.full_name.strip(), password_hash=password_hash.hash(data.password), role=Role.customer.value)
     db.add(user)
@@ -277,14 +372,16 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(db_sessio
         db.rollback()
         raise HTTPException(status_code=409, detail="Email already registered")
     db.refresh(user)
-    return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}}
+    return authentication_result(user, db, request, response)
 
 @app.post("/api/auth/login")
 @limiter.limit("10/minute")
-def login(data: LoginIn, request: Request, db: Session = Depends(db_session)):
+def login(data: LoginIn, request: Request, response: Response, db: Session = Depends(db_session)):
+    browser_panel(request)
     user = db.scalar(select(User).where(User.email == data.email.lower()))
-    if not user or not password_hash.verify(data.password, user.password_hash) or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
-    return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}}
+    valid = password_hash.verify(data.password, user.password_hash if user else _dummy_password_hash)
+    if not user or not valid or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
+    return authentication_result(user, db, request, response)
 
 @app.post("/api/auth/password")
 @limiter.limit("5/minute")
@@ -294,8 +391,19 @@ def change_password(data: PasswordChangeIn, request: Request, db: Session = Depe
     if data.new_password == data.current_password:
         raise HTTPException(status_code=422, detail="Choose a different password")
     user.password_hash = password_hash.hash(data.new_password)
+    db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
     db.commit()
     return {"message": "Password updated. Sign in again."}
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response, db: Session = Depends(db_session), user: User = Depends(current_user)):
+    db.execute(delete(AuthSession).where(AuthSession.digest == request.state.auth_session_digest))
+    db.commit()
+    panel = browser_panel(request)
+    if panel:
+        response.delete_cookie(cookie_name(panel), path="/api", secure=settings.app_env == "production", httponly=True, samesite="strict")
+    return {"message": "Signed out"}
+
 
 @app.get("/api/me")
 def me(user: User = Depends(current_user)): return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}
@@ -370,7 +478,7 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
 
 @app.get("/api/plots")
 def list_plots(db: Session = Depends(db_session)):
-    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
+    return [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude} for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
 
 @app.post("/api/plots", status_code=201)
 def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
@@ -444,14 +552,8 @@ class AdminSettingsIn(BaseModel):
 class ReferralDecisionIn(BaseModel):
     status: str = Field(pattern="^(approved|rejected|paid)$")
     reward_amount: float = Field(ge=0, le=100000000)
-class PlotUpdateIn(BaseModel):
-    project: str = Field(min_length=2, max_length=160)
-    plot_number: str = Field(min_length=1, max_length=40)
-    area_sqft: float = Field(gt=0, le=1000000)
-    rate_per_sqft: float = Field(gt=0, le=1000000)
-    status: str = Field(pattern="^(available|reserved|sold)$")
-    x: float = Field(ge=0, le=10000)
-    y: float = Field(ge=0, le=10000)
+class PlotUpdateIn(PlotIn):
+    pass
 
 def write_admin_audit(db: Session, actor: User, action: str, target: str = ""):
     db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160]))
@@ -500,7 +602,10 @@ def admin_set_user_active(user_id:int, active:bool, db:Session=Depends(db_sessio
     target=db.get(User,user_id)
     if not target: raise HTTPException(status_code=404,detail="User not found")
     if target.id==user.id and not active: raise HTTPException(status_code=400,detail="You cannot deactivate your own account")
-    target.is_active=active; db.commit()
+    target.is_active=active
+    if not active:
+        db.execute(delete(AuthSession).where(AuthSession.user_id == target.id))
+    db.commit()
     write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}")
     return {"id":target.id,"is_active":target.is_active}
 
@@ -545,6 +650,7 @@ def seed_business_settings():
 class SupportMessageIn(BaseModel):
     body: str = Field(min_length=1, max_length=2000)
     client_id: str = Field(min_length=16, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    ai_consent: bool = False
 
     @field_validator("body")
     @classmethod
@@ -590,6 +696,16 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
             reply = respond(data.body, customer.full_name, state.state, projects, available)
+            # The model can answer questions, never create a lead or alter slots.
+            if data.ai_consent and settings.ai_enabled and settings.openai_api_key.get_secret_value() and not reply.lead and reply.state == (state.state or {}):
+                from .ai_support import answer_question, eligible_question
+                if eligible_question(data.body):
+                    public_plots = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
+                    ai_text = answer_question(data.body, public_plots, settings.openai_api_key.get_secret_value(), settings.openai_model)
+                    if ai_text:
+                        if reply.state.get("flow"):
+                            ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
+                        reply.text = ai_text
             state.state, state.quick = reply.state, reply.quick
             db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text))
             if reply.lead:
@@ -613,7 +729,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
 @app.get("/api/customer/chat-state")
 def customer_chat_state(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
     state = db.get(ChatState, user.id)
-    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow"))}
+    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow")), "ai_available": bool(settings.ai_enabled and settings.openai_api_key.get_secret_value())}
 
 
 @app.get("/api/customer/messages")
