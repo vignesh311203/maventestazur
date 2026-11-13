@@ -31,7 +31,7 @@ def answer_question(body, inventory, api_key, model, post=None):
     )
     try:
         response = post("https://api.openai.com/v1/responses", headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-                        json={"model": model, "instructions": instructions, "input": json.dumps({"question": safe_question(body), "public_inventory": inventory}, ensure_ascii=False), "max_output_tokens": 650, "store": False}, timeout=(3, 12))
+                        json={"model": model, "instructions": instructions, "input": json.dumps({"question": safe_question(body), "public_inventory": inventory}, ensure_ascii=False), "max_output_tokens": 650, "reasoning": {"effort": "low"}, "store": False}, timeout=(3, 12))
         if response.status_code != 200:
             return None
         data = response.json()

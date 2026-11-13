@@ -8,6 +8,7 @@ import jwt
 import hashlib
 import hmac
 import secrets
+import re
 from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -18,7 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import delete, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -794,21 +795,93 @@ def queue_reporting_changes(db, flush_context, instances):
         db.add(SheetOutbox())
 
 
+class ReportConfigIn(BaseModel):
+    email: EmailStr | None = None
+    sheet_id: str = Field(default="", max_length=300)
+    current_password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("sheet_id")
+    @classmethod
+    def validate_sheet(cls, value):
+        value = value.strip()
+        if value.startswith("https://docs.google.com/spreadsheets/d/"):
+            value = value.split("/d/", 1)[1].split("/", 1)[0]
+        if value and not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", value):
+            raise ValueError("Use a valid Google spreadsheet ID or URL")
+        return value
+
+class ReportSendIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    authorized_recipient: bool = False
+
+def reporting_config(db: Session):
+    destination = db.get(ReportDestination, 1)
+    return {"email": destination.email if destination else "", "sheet_id": destination.sheet_id if destination else settings.google_sheet_id}
+
+@app.get("/api/admin/reports/config")
+def get_report_config(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .report_mail import email_ready
+    return {**reporting_config(db), "email_ready": email_ready(settings), "ai_available": bool(settings.ai_enabled and settings.openai_api_key.get_secret_value())}
+
+@app.patch("/api/admin/reports/config")
+@limiter.limit("5/minute")
+def update_report_config(request: Request, data: ReportConfigIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    if not password_hash.verify(data.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    # Serialize destination changes with the reporting worker to avoid writes
+    # to a former destination after the change has been acknowledged.
+    if db.bind.dialect.name == "postgresql" and not db.execute(text("SELECT pg_try_advisory_xact_lock(52403181)")).scalar():
+        raise HTTPException(status_code=409, detail="Synchronization is in progress. Try again shortly.")
+    destination = db.get(ReportDestination, 1)
+    if destination is None:
+        destination = ReportDestination(id=1, email="", sheet_id="")
+        db.add(destination)
+    destination.email = str(data.email) if data.email else ""
+    destination.sheet_id = data.sheet_id
+    db.add(SheetOutbox())
+    db.add(AdminAudit(actor_id=user.id, action="reporting.destination_changed", target="private reporting destinations"))
+    db.commit()
+    return reporting_config(db)
+
+@app.post("/api/admin/reports/email")
+@limiter.limit("3/minute")
+def email_report(request: Request, data: ReportSendIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    from .report_mail import email_ready, send_report
+    from .sheet_sync import snapshot, export_zip
+    if not password_hash.verify(data.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if not data.authorized_recipient:
+        raise HTTPException(status_code=422, detail="Confirm the recipient is authorized to receive private records")
+    destination = reporting_config(db)
+    if not destination["email"] or not email_ready(settings):
+        raise HTTPException(status_code=409, detail="Configure the reporting email and SMTP provider first")
+    archive = export_zip(snapshot(db))
+    if len(archive) > 10_000_000:
+        raise HTTPException(status_code=413, detail="Report is too large for email. Download it privately instead.")
+    try:
+        send_report(settings, destination["email"], archive)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Email provider unavailable. Download the private report instead.") from None
+    db.add(AdminAudit(actor_id=user.id, action="reporting.email_sent", target="configured recipient"))
+    db.commit()
+    return {"message": "Report accepted by email provider. Check the recipient inbox."}
+
 @app.get("/api/admin/sheets/status")
 def sheets_status(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     from .sheet_sync import configured
+    sheet_id = reporting_config(db)["sheet_id"]
     state = db.get(SheetSyncStatus, 1)
-    same = bool(state and state.sheet_id == settings.google_sheet_id)
-    return {"configured": configured(settings), "pending_changes": db.scalar(select(func.count(SheetOutbox.id))) or 0,
+    same = bool(state and state.sheet_id == sheet_id)
+    enabled = configured(settings, sheet_id)
+    return {"configured": enabled, "pending_changes": db.scalar(select(func.count(SheetOutbox.id))) or 0,
             "last_success": state.last_success.isoformat() if same and state.last_success else None,
-            "last_error": state.last_error if state else "", "sheet_url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheet_id if configured(settings) else None}
-
+            "last_error": state.last_error if same else "", "sheet_url": "https://docs.google.com/spreadsheets/d/" + sheet_id if enabled else None}
 
 @app.post("/api/admin/sheets/sync", status_code=202)
 @limiter.limit("5/minute")
 def request_sheet_sync(request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     from .sheet_sync import configured
-    if not configured(settings):
+    if not configured(settings, reporting_config(db)["sheet_id"]):
         raise HTTPException(status_code=409, detail="Google Sheets is not configured")
     db.add(SheetOutbox())
     db.commit()
