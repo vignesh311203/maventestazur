@@ -1,0 +1,5 @@
+"""Versioned notice/consent text for new records. Historical wording is not backfilled."""
+NOTICE_VERSION = "2026-11-13-v1"
+CONTACT_FORM_TEXT = "I agree to be contacted about this enquiry and have read the privacy notice."
+CHAT_CONTACT_TEXT = "May our property team contact you on that number about this request?"
+AI_CONSENT_TEXT = "Use AI to answer my questions (this question and up to 14 recent messages between you and the automated assistant may be sent to an external AI provider; avoid personal information)."

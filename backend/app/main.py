@@ -12,6 +12,8 @@ import uuid
 from limits import parse
 from starlette.concurrency import run_in_threadpool
 from .request_security import client_ip, account_key
+from .admin_security import new_secret, seal_secret, open_secret, matching_step, new_recovery_codes, consume_recovery_code
+from .privacy_policy import NOTICE_VERSION, CONTACT_FORM_TEXT, CHAT_CONTACT_TEXT, AI_CONSENT_TEXT
 import jwt
 import hashlib
 import hmac
@@ -45,6 +47,7 @@ class Settings(BaseSettings):
     client_ip_mode: Literal["socket", "railway"] = "socket"
     public_base_url: str = ""
     external_full_customer_reports: bool = False
+    admin_mfa_required: bool = False
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     ai_enabled: bool = False
@@ -100,6 +103,9 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), default=Role.customer.value)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    privacy_notice_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    privacy_notice_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    erased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 class AuthSession(Base):
     __tablename__ = "auth_sessions"
@@ -107,6 +113,29 @@ class AuthSession(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
+class AdminMfa(Base):
+    __tablename__ = "admin_mfa"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    secret_ciphertext: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_step: Mapped[int] = mapped_column(Integer, default=-1)
+    recovery_hashes: Mapped[list] = mapped_column(JSON, default=list)
+
+class PrivacyRequest(Base):
+    __tablename__ = "privacy_requests"
+    __table_args__ = (
+        CheckConstraint("kind IN ('erasure','correction','withdraw_contact')", name="ck_privacy_kind"),
+        CheckConstraint("status IN ('pending','in_review','resolved','declined','erased')", name="ck_privacy_status"),
+        Index("ix_privacy_status_created", "status", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_code: Mapped[str] = mapped_column(String(40), default="", server_default="")
 
 class ReportDestination(Base):
     __tablename__ = "report_destinations"
@@ -129,6 +158,8 @@ class Lead(Base):
     _legacy_consent: Mapped[bool] = mapped_column("consent_whatsapp", Boolean, default=False)
     contact_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     contact_consent_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    contact_consent_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contact_consent_withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     request_type: Mapped[str] = mapped_column(String(30), default="enquiry", server_default="enquiry")
     source: Mapped[str] = mapped_column(String(30), default="website", server_default="website")
     preferred_time: Mapped[str] = mapped_column(String(80), default="", server_default="")
@@ -192,6 +223,9 @@ class SupportMessage(Base):
     sender: Mapped[str] = mapped_column(String(16))
     client_id: Mapped[str] = mapped_column(String(80))
     body: Mapped[str] = mapped_column(Text)
+    ai_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_consent_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    ai_consent_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -319,6 +353,7 @@ def db_session() -> Generator[Session, None, None]:
     finally: db.close()
 
 class RegisterIn(BaseModel):
+    privacy_acknowledged: bool = False
     email: EmailStr
     full_name: str = Field(min_length=2, max_length=160)
     password: str = Field(min_length=12, max_length=128)
@@ -331,6 +366,7 @@ class PasswordChangeIn(BaseModel):
     new_password: str = Field(min_length=12, max_length=128)
 
 class LoginIn(BaseModel):
+    mfa_code: str = Field(default="", max_length=64)
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
 def clean_name(value: str) -> str:
@@ -493,6 +529,12 @@ def current_user(request: Request, credentials: HTTPAuthorizationCredentials | N
 def require_roles(*roles: Role):
     def dependency(user: User = Depends(current_user)) -> User:
         if user.role not in [r.value for r in roles]: raise HTTPException(status_code=403, detail="Insufficient permissions")
+        if user.role == Role.admin.value and settings.admin_mfa_required:
+            # Existing administrators may enroll via the dedicated setup endpoints.
+            with SessionLocal() as check_db:
+                factor = check_db.get(AdminMfa, user.id)
+                if not factor or not factor.enabled:
+                    raise HTTPException(status_code=403, detail="Set up administrator MFA under Account security before using this feature")
         return user
     return dependency
 
@@ -512,8 +554,10 @@ def ready(db: Session = Depends(db_session)):
 def register(data: RegisterIn, request: Request, response: Response, db: Session = Depends(db_session)):
     if browser_panel(request) not in {None, "customer"}:
         raise HTTPException(status_code=403, detail="Registration is for customers only")
+    if not data.privacy_acknowledged:
+        raise HTTPException(status_code=422, detail="Acknowledge the privacy notice before creating your account")
     if db.scalar(select(User).where(User.email == data.email.lower())): raise HTTPException(status_code=409, detail="Email already registered")
-    user = User(email=data.email.lower(), full_name=data.full_name.strip(), password_hash=password_hash.hash(data.password), role=Role.customer.value)
+    user = User(email=data.email.lower(), full_name=data.full_name.strip(), password_hash=password_hash.hash(data.password), role=Role.customer.value, privacy_notice_version=NOTICE_VERSION, privacy_notice_ack_at=datetime.now(timezone.utc))
     db.add(user)
     try: db.commit()
     except IntegrityError:
@@ -529,15 +573,32 @@ def login(data: LoginIn, request: Request, response: Response, db: Session = Dep
     key = account_key(settings.app_secret_key, str(data.email))
     if not limiter._limiter.hit(parse("10/15 minutes"), "login-account", key):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again in 15 minutes.", headers={"Retry-After":"900"})
-    user = db.scalar(select(User).where(User.email == data.email.lower()))
+    user = db.scalar(select(User).where(User.email == data.email.lower()).with_for_update())
     valid = password_hash.verify(data.password, user.password_hash if user else _dummy_password_hash)
     if not user or not valid or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
+    panel = browser_panel(request)
+    if panel and panel != user.role:
+        raise HTTPException(status_code=403, detail="This account cannot access this panel. Use the appropriate account page.")
+    if user.role == Role.admin.value:
+        factor = db.get(AdminMfa, user.id)
+        if factor and factor.enabled:
+            code = data.mfa_code.strip()
+            step = matching_step(open_secret(settings.app_secret_key, user.id, factor.secret_ciphertext), code, factor.last_step)
+            if step is not None:
+                factor.last_step = step
+            else:
+                remaining = consume_recovery_code(settings.app_secret_key, user.id, factor.recovery_hashes, code)
+                if remaining is None:
+                    raise HTTPException(status_code=401, detail="Enter a valid authenticator code or unused recovery code")
+                factor.recovery_hashes = remaining
+                write_admin_audit(db,user,"admin.mfa_recovery_used",str(user.id))
     return authentication_result(user, db, request, response)
 
 @app.post("/api/auth/password")
 @limiter.limit("5/minute")
 def change_password(data: PasswordChangeIn, request: Request, db: Session = Depends(db_session), user: User = Depends(current_user)):
-    if not password_hash.verify(data.current_password, user.password_hash):
+    user = db.scalar(select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True))
+    if not user.is_active or not password_hash.verify(data.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if data.new_password == data.current_password:
         raise HTTPException(status_code=422, detail="Choose a different password")
@@ -545,6 +606,92 @@ def change_password(data: PasswordChangeIn, request: Request, db: Session = Depe
     db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
     db.commit()
     return {"message": "Password updated. Sign in again."}
+
+class MfaStartIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+
+class MfaConfirmIn(MfaStartIn):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+def enrollment_admin(user: User = Depends(current_user)):
+    if user.role != Role.admin.value:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return user
+
+def lock_active_user(db, user):
+    current = db.scalar(select(User).where(User.id==user.id).with_for_update().execution_options(populate_existing=True))
+    if not current or not current.is_active:
+        raise HTTPException(status_code=409, detail="Account unavailable")
+    return current
+
+def confirm_password(user, password):
+    if not password_hash.verify(password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+@app.get("/api/admin/mfa/status")
+def admin_mfa_status(db: Session = Depends(db_session), user: User = Depends(enrollment_admin)):
+    factor = db.get(AdminMfa, user.id)
+    return {"enabled":bool(factor and factor.enabled),"required":settings.admin_mfa_required,"recovery_codes_remaining":len(factor.recovery_hashes) if factor and factor.enabled else 0}
+
+@app.post("/api/admin/mfa/start")
+@limiter.limit("5/minute")
+def admin_mfa_start(request: Request, data: MfaStartIn, db: Session = Depends(db_session), user: User = Depends(enrollment_admin)):
+    user = lock_active_user(db,user)
+    confirm_password(user,data.current_password)
+    factor = db.get(AdminMfa,user.id)
+    if factor and factor.enabled:
+        raise HTTPException(status_code=409,detail="MFA is already enabled")
+    secret = new_secret()
+    if factor is None:
+        factor = AdminMfa(user_id=user.id, secret_ciphertext="")
+        db.add(factor)
+    factor.secret_ciphertext = seal_secret(settings.app_secret_key,user.id,secret)
+    factor.expires_at = datetime.now(timezone.utc)+timedelta(minutes=10)
+    factor.enabled = False
+    factor.last_step = -1
+    factor.recovery_hashes = []
+    db.commit()
+    return {"secret":secret,"issuer":"MetroEstate","account":user.email,"expires_in_seconds":600}
+
+@app.post("/api/admin/mfa/confirm")
+@limiter.limit("5/minute")
+def admin_mfa_confirm(request: Request, data: MfaConfirmIn, db: Session = Depends(db_session), user: User = Depends(enrollment_admin)):
+    user = lock_active_user(db,user)
+    confirm_password(user,data.current_password)
+    factor = db.get(AdminMfa,user.id)
+    now = datetime.now(timezone.utc)
+    expiry = factor.expires_at if factor else None
+    if expiry and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if not factor or factor.enabled or not expiry or expiry <= now:
+        raise HTTPException(status_code=409,detail="Start a new MFA setup")
+    step = matching_step(open_secret(settings.app_secret_key,user.id,factor.secret_ciphertext),data.code,-1)
+    if step is None:
+        raise HTTPException(status_code=400,detail="Invalid authenticator code")
+    codes, hashes = new_recovery_codes(settings.app_secret_key,user.id)
+    factor.enabled, factor.expires_at, factor.last_step, factor.recovery_hashes = True, None, step, hashes
+    db.execute(delete(AuthSession).where(AuthSession.user_id==user.id))
+    write_admin_audit(db,user,"admin.mfa_enabled",str(user.id))
+    db.commit()
+    return {"recovery_codes":codes,"message":"MFA enabled. Save these codes securely; sign in again using a fresh code."}
+
+@app.post("/api/admin/mfa/recovery-codes")
+@limiter.limit("3/minute")
+def admin_mfa_rotate(request: Request, data: MfaConfirmIn, db: Session = Depends(db_session), user: User = Depends(enrollment_admin)):
+    user = lock_active_user(db,user)
+    confirm_password(user,data.current_password)
+    factor = db.get(AdminMfa,user.id)
+    if not factor or not factor.enabled:
+        raise HTTPException(status_code=409,detail="Enable MFA first")
+    step = matching_step(open_secret(settings.app_secret_key,user.id,factor.secret_ciphertext),data.code,factor.last_step)
+    if step is None:
+        raise HTTPException(status_code=400,detail="Enter a fresh authenticator code")
+    codes, hashes = new_recovery_codes(settings.app_secret_key,user.id)
+    factor.last_step, factor.recovery_hashes = step, hashes
+    db.execute(delete(AuthSession).where(AuthSession.user_id==user.id))
+    write_admin_audit(db,user,"admin.mfa_recovery_rotated",str(user.id))
+    db.commit()
+    return {"recovery_codes":codes,"message":"Recovery codes replaced. Old codes are invalid. Sign in again."}
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response, db: Session = Depends(db_session), user: User = Depends(current_user)):
@@ -580,16 +727,18 @@ def growth(initial_value: float = Query(gt=0, le=1e12), annual_growth_percent: f
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     query = select(Lead).order_by(Lead.created_at.desc()).limit(500)
-    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "request_type": x.request_type, "source": x.source, "preferred_time": x.preferred_time, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None} for x in db.scalars(query)]
+    return [{"id": x.id, "name": x.name, "phone": x.phone, "email": x.email, "interest": x.interest, "status": x.status, "request_type": x.request_type, "source": x.source, "preferred_time": x.preferred_time, "contact_consent_at": x.contact_consent_at.isoformat() if x.contact_consent_at else None, "contact_consent_withdrawn_at": x.contact_consent_withdrawn_at.isoformat() if x.contact_consent_withdrawn_at else None} for x in db.scalars(query)]
 
 @app.post("/api/leads", status_code=201)
 @limiter.limit("20/minute")
 def create_lead(data: LeadIn, request: Request, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin, Role.customer))):
     if user.role == Role.customer.value and not data.consent:
         raise HTTPException(status_code=422, detail="Confirm contact consent before submitting")
+    if user.role == Role.customer.value:
+        user = lock_active_user(db,user)
     lead = Lead(owner_id=user.id, name=user.full_name if user.role == Role.customer.value else data.name.strip(), phone=data.phone.strip(),
                 email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip(),
-                source="customer" if user.role == Role.customer.value else "admin", contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
+                source="customer" if user.role == Role.customer.value else "admin", contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version=NOTICE_VERSION if data.consent else None, contact_consent_text=CONTACT_FORM_TEXT if data.consent and user.role==Role.customer.value else None)
     db.add(lead)
     db.flush()
     if user.role == Role.admin.value:
@@ -606,7 +755,7 @@ def public_enquiry(data: PublicEnquiryIn, request: Request, db: Session = Depend
     owner = db.scalar(select(User).where(User.role == Role.admin.value, User.is_active.is_(True)).order_by(User.id).limit(1))
     if not owner:
         raise HTTPException(status_code=503, detail="Enquiries temporarily unavailable")
-    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), source="public", contact_consent_at=datetime.now(timezone.utc), contact_consent_version="2026-11-12")
+    item = Lead(owner_id=owner.id, name=data.name, phone=data.phone, email=str(data.email).lower() if data.email else None, interest=data.interest.strip(), source="public", contact_consent_at=datetime.now(timezone.utc), contact_consent_version=NOTICE_VERSION, contact_consent_text=CONTACT_FORM_TEXT)
     db.add(item)
     db.commit()
     return {"message": "Your enquiry has been received."}
@@ -734,8 +883,8 @@ def list_referrals(db: Session = Depends(db_session), user: User = Depends(requi
 @app.post("/api/reviews/requests", status_code=201)
 def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     if not data.consent_confirmed: raise HTTPException(status_code=400, detail="Explicit customer consent is required before review outreach")
-    customer = db.get(User, data.customer_id)
-    if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
+    customer = db.scalar(select(User).where(User.id==data.customer_id).with_for_update())
+    if not customer or not customer.is_active or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
     db.add(item)
     db.flush()
@@ -847,6 +996,7 @@ def admin_set_user_active(user_id:int, active:bool, db:Session=Depends(db_sessio
     target=db.scalar(select(User).where(User.id==user_id).with_for_update())
     if not target: raise HTTPException(status_code=404,detail="User not found")
     if target.id==user.id and not active: raise HTTPException(status_code=400,detail="You cannot deactivate your own account")
+    if active and target.erased_at: raise HTTPException(status_code=409,detail="An erased account cannot be reactivated")
     before = {"is_active":target.is_active}
     target.is_active=active
     if not active:
@@ -984,16 +1134,19 @@ def support_history(db: Session, customer_id: int, before_id: int | None, limit:
 
 def save_support(db: Session, customer_id: int, sender: str, data: SupportMessageIn) -> dict:
     # Serialize per-customer changes in PostgreSQL, including retries across replicas.
-    customer = db.scalar(select(User).where(User.id == customer_id).with_for_update())
+    customer = db.scalar(select(User).where(User.id == customer_id).with_for_update().execution_options(populate_existing=True))
     if not customer or not customer.is_active:
         raise HTTPException(status_code=409, detail="Customer account is inactive")
     key = sender + ":" + data.client_id
     existing = db.scalar(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.client_id == key))
     if existing:
-        if existing.body != data.body:
+        if existing.body != data.body or (sender=="customer" and bool(existing.ai_consent_at)!=data.ai_consent):
             raise HTTPException(status_code=409, detail="Message request ID already used")
         return support_view(existing)
-    item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body)
+    item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body,
+                          ai_consent_at=datetime.now(timezone.utc) if sender=="customer" and data.ai_consent else None,
+                          ai_consent_version=NOTICE_VERSION if sender=="customer" and data.ai_consent else None,
+                          ai_consent_text=AI_CONSENT_TEXT if sender=="customer" and data.ai_consent else None)
     db.add(item)
     ai_job = None
     assistant = None
@@ -1029,7 +1182,8 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                             phone=data_lead["phone"], interest=data_lead["interest"][:255], request_type=data_lead["request_type"],
                             preferred_time=data_lead["preferred_time"], source="chat",
                             contact_consent_at=datetime.now(timezone.utc) if data_lead["consent"] else None,
-                            contact_consent_version="2026-11-12" if data_lead["consent"] else None))
+                            contact_consent_version=NOTICE_VERSION if data_lead["consent"] else None,
+                             contact_consent_text=CHAT_CONTACT_TEXT if data_lead["consent"] else None))
 
         db.commit()
     except IntegrityError:
@@ -1061,6 +1215,123 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                     update_db.commit()
     return result
 
+
+def privacy_view(item):
+    return {"id":item.id,"kind":item.kind,"status":item.status,"created_at":item.created_at.isoformat(),
+            "resolved_at":item.resolved_at.isoformat() if item.resolved_at else None,"resolution_code":item.resolution_code}
+
+class PrivacyRequestIn(BaseModel):
+    kind: Literal["erasure","correction","withdraw_contact"]
+    current_password: str = Field(min_length=1,max_length=128)
+
+class PrivacyDecisionIn(BaseModel):
+    decision: Literal["in_review","resolved","declined","erase_application"]
+    current_password: str = Field(min_length=1,max_length=128)
+    retention_reviewed: bool = False
+    external_copies_reviewed: bool = False
+
+@app.get("/api/customer/privacy/requests")
+def own_privacy_requests(db: Session=Depends(db_session), user: User=Depends(require_roles(Role.customer))):
+    return [privacy_view(x) for x in db.scalars(select(PrivacyRequest).where(PrivacyRequest.customer_id==user.id).order_by(PrivacyRequest.id.desc()).limit(100))]
+
+@app.get("/api/customer/privacy/export")
+@limiter.limit("3/minute")
+def own_privacy_export(request: Request, db: Session=Depends(db_session), user: User=Depends(require_roles(Role.customer))):
+    # Account-owned records only. Guest enquiries and third-party referrals require a separate verified request.
+    def iso(value):
+        return value.isoformat() if value else None
+    leads = [{"id":x.id,"name":x.name,"phone":x.phone,"email":x.email,"interest":x.interest,"status":x.status,
+              "source":x.source,"request_type":x.request_type,"preferred_time":x.preferred_time,"created_at":iso(x.created_at),
+              "contact_consent_at":iso(x.contact_consent_at),"contact_consent_version":x.contact_consent_version,
+              "contact_consent_text":x.contact_consent_text,"contact_consent_withdrawn_at":iso(x.contact_consent_withdrawn_at)}
+             for x in db.scalars(select(Lead).where(Lead.owner_id==user.id).order_by(Lead.id))]
+    messages = [{**support_view(x),"ai_consent_at":iso(x.ai_consent_at),"ai_consent_version":x.ai_consent_version,"ai_consent_text":x.ai_consent_text}
+                for x in db.scalars(select(SupportMessage).where(SupportMessage.customer_id==user.id).order_by(SupportMessage.id))]
+    reviews = [{"id":x.id,"channel":x.channel,"status":x.status,"consent_confirmed":x.consent_confirmed,"created_at":iso(x.created_at)}
+               for x in db.scalars(select(ReviewRequest).where(ReviewRequest.customer_id==user.id))]
+    state = db.get(ChatState,user.id)
+    return JSONResponse({"account":{"id":user.id,"name":user.full_name,"email":user.email,"created_at":iso(user.created_at),
+                        "privacy_notice_version":user.privacy_notice_version,"privacy_notice_ack_at":iso(user.privacy_notice_ack_at)},
+                         "enquiries":leads,"messages":messages,"review_requests":reviews,
+                         "chat_state":state.state if state else None,"privacy_requests":own_privacy_requests(db,user),
+                         "scope":"Account-owned application records only; contact the property team about verified guest enquiries, third-party records or external copies."},
+                        headers={"Content-Disposition":'attachment; filename="metroestate-my-data.json"'})
+
+@app.post("/api/customer/privacy/requests",status_code=201)
+@limiter.limit("5/minute")
+def create_privacy_request(request: Request, data: PrivacyRequestIn, db: Session=Depends(db_session), user: User=Depends(require_roles(Role.customer))):
+    user = lock_active_user(db,user)
+    confirm_password(user,data.current_password)
+    if data.kind != "withdraw_contact":
+        existing = db.scalar(select(PrivacyRequest).where(PrivacyRequest.customer_id==user.id,PrivacyRequest.kind==data.kind,
+                         PrivacyRequest.status.in_(["pending","in_review"])).order_by(PrivacyRequest.id.desc()).limit(1))
+        if existing:
+            return privacy_view(existing)
+    now = datetime.now(timezone.utc)
+    item = PrivacyRequest(customer_id=user.id,kind=data.kind)
+    if data.kind=="withdraw_contact":
+        for lead in db.scalars(select(Lead).where(Lead.owner_id==user.id,Lead.contact_consent_at.is_not(None),Lead.contact_consent_withdrawn_at.is_(None))):
+            lead.contact_consent_withdrawn_at=now
+        item.status="resolved"
+        item.resolved_at=now
+        item.resolution_code="account_contact_withdrawn"
+        db.add(SheetOutbox())
+    db.add(item)
+    db.commit()
+    return privacy_view(item)
+
+@app.get("/api/admin/privacy/requests")
+def admin_privacy_requests(status: Literal["open","all"]="open",limit: int=Query(default=100,ge=1,le=200),db: Session=Depends(db_session),user: User=Depends(require_roles(Role.admin))):
+    stmt=select(PrivacyRequest,User).join(User,User.id==PrivacyRequest.customer_id)
+    if status=="open":
+        stmt=stmt.where(PrivacyRequest.status.in_(["pending","in_review"]))
+    return [{**privacy_view(item),"customer_id":customer.id,"customer_name":customer.full_name}
+            for item,customer in db.execute(stmt.order_by(PrivacyRequest.id.desc()).limit(limit))]
+
+@app.patch("/api/admin/privacy/requests/{request_id}")
+@limiter.limit("5/minute")
+def admin_privacy_decision(request: Request,request_id:int,data: PrivacyDecisionIn,db: Session=Depends(db_session),user: User=Depends(require_roles(Role.admin))):
+    confirm_password(user,data.current_password)
+    item=db.scalar(select(PrivacyRequest).where(PrivacyRequest.id==request_id).with_for_update())
+    if not item:
+        raise HTTPException(status_code=404,detail="Privacy request not found")
+    if item.status not in {"pending","in_review"}:
+        raise HTTPException(status_code=409,detail="This request is already closed")
+    before={"status":item.status}
+    if data.decision=="erase_application":
+        if item.kind!="erasure" or item.status!="in_review" or not data.retention_reviewed or not data.external_copies_reviewed:
+            raise HTTPException(status_code=422,detail="Review the erasure request, legal retention obligations and external copies first")
+        customer=db.scalar(select(User).where(User.id==item.customer_id).with_for_update().execution_options(populate_existing=True))
+        if not customer or customer.role!=Role.customer.value or customer.erased_at:
+            raise HTTPException(status_code=409,detail="Customer account unavailable")
+        if db.scalar(select(Referral.id).where(Referral.referrer_id==customer.id).limit(1)) is not None:
+            raise HTTPException(status_code=409,detail="Referral records need separate retention review; no data was erased")
+        # Preserve a non-identifying account tombstone and minimal privacy audit references.
+        # Do not guess which guest or third-party records belong to this account.
+        for model,column in ((AuthSession,AuthSession.user_id),(ChatState,ChatState.customer_id),
+                             (SupportMessage,SupportMessage.customer_id),(ReviewRequest,ReviewRequest.customer_id),(Lead,Lead.owner_id)):
+            db.execute(delete(model).where(column==customer.id))
+        customer.email=f"erased-{customer.id}-{secrets.token_hex(8)}@example.invalid"
+        customer.full_name="Erased customer"
+        customer.password_hash=password_hash.hash(secrets.token_urlsafe(32))
+        customer.is_active=False
+        customer.privacy_notice_version=None
+        customer.privacy_notice_ack_at=None
+        customer.erased_at=datetime.now(timezone.utc)
+        item.status="erased"
+        item.resolution_code="application_erased"
+        item.resolved_at=customer.erased_at
+        db.add(SheetOutbox())
+    else:
+        if data.decision=="resolved" and item.kind=="erasure":
+            raise HTTPException(status_code=422,detail="Use the explicit reviewed application-erasure action or decline the request")
+        item.status=data.decision
+        if data.decision in {"resolved","declined"}:
+            item.resolved_at=datetime.now(timezone.utc)
+            item.resolution_code="manual_"+data.decision
+    write_admin_audit(db,user,"privacy.request_decision",str(item.id),before,{"status":item.status,"resolution_code":item.resolution_code})
+    db.commit()
+    return privacy_view(item)
 
 @app.get("/api/customer/chat-state")
 def customer_chat_state(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
