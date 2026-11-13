@@ -12,7 +12,8 @@ export default function PlotListingFields({value,onChange,disabled=false}){
  const [error,setError]=useState(""),[reading,setReading]=useState(false);
  const fileRef=useRef(null),generation=useRef(0);
  useEffect(()=>()=>{generation.current++},[]);
- function update(k,v){onChange({...value,[k]:v})}
+ useEffect(()=>{if(!value.photo_data&&fileRef.current)fileRef.current.value=""},[value.photo_data]);
+ function update(k,v){onChange(old=>({...old,[k]:v}))}
  async function photoSelected(e){
    const file=e.target.files?.[0];if(!file)return;
    const current=++generation.current;
@@ -20,23 +21,23 @@ export default function PlotListingFields({value,onChange,disabled=false}){
    if(file.size>MAX||!["image/jpeg","image/png","image/webp"].includes(file.type)){
      setError("Choose a JPEG, PNG or WebP photo up to 2 MB.");e.target.value="";return;
    }
-   setReading(true);
+   setReading(true);onChange(v=>({...v,photo_reading:true}));
    try{
      const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=reject;reader.readAsDataURL(file)});
      if(generation.current!==current)return;
-     onChange(v=>({...v,photo_data:data.split(",")[1],remove_photo:false}));
+     onChange(v=>({...v,photo_data:data.split(",")[1],photo_mime:file.type,photo_reading:false,remove_photo:false}));
    }catch{if(generation.current===current)setError("Could not read this photo. Choose another file.")}
-   finally{if(generation.current===current)setReading(false)}
+   finally{if(generation.current===current){setReading(false);onChange(v=>({...v,photo_reading:false}))}}
  }
  function remove(){
    generation.current++;setReading(false);setError("");if(fileRef.current)fileRef.current.value="";
-   onChange(v=>({...v,photo_data:null,remove_photo:true}));
+   onChange(v=>({...v,photo_data:null,photo_reading:false,photo_mime:null,remove_photo:true}));
  }
  return <fieldset className="listing-fields" disabled={disabled}><legend>Public property listing details</legend>
    <div className="photo-upload"><label>Property photo (JPEG, PNG or WebP)<input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={photoSelected} disabled={reading}/></label>
    <small>Upload an actual property photograph, up to 2 MB. It will be resized and published on the customer website. Do not upload identity documents, personal photos or misleading renderings.</small>
    {error&&<p role="alert" className="notice">{error}</p>}{reading&&<p role="status">Preparing photo…</p>}
-   {value.photo_data?<img className="listing-photo preview" src={"data:image/jpeg;base64,"+value.photo_data} alt="Selected property photo preview"/>:!value.remove_photo&&value.photo_url?<ListingPhoto plot={value} className="preview"/>:<div className="photo-empty">No property photo selected</div>}
+   {value.photo_data?<img className="listing-photo preview" src={("data:"+ (value.photo_mime||"image/jpeg")+";base64,")+value.photo_data} alt="Selected property photo preview"/>:!value.remove_photo&&value.photo_url?<ListingPhoto plot={value} className="preview"/>:<div className="photo-empty">No property photo selected</div>}
    {(value.photo_data||(!value.remove_photo&&value.photo_url))&&<button type="button" className="outline" onClick={remove}>Remove property photo</button>}
    </div>
    <label>Property description<textarea rows="4" maxLength="3000" value={value.description||""} onChange={e=>update("description",e.target.value)} placeholder="Describe the project, plot and nearby facilities."/></label>
