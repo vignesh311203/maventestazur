@@ -229,7 +229,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_inventory_review"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_security_hardening"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -908,48 +908,3 @@ def test_ai_fallback_committed_before_provider(client,monkeypatch):
     assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
     assert len(calls)==1
     assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="Loan explanation."
-
-
-def test_legacy_duplicate_inventory_migration(tmp_path,monkeypatch):
-    from alembic import command
-    from alembic.config import Config
-    from pathlib import Path
-    from sqlalchemy import text,create_engine
-    url="sqlite:///"+str(tmp_path/"duplicates.db")
-    monkeypatch.setenv("DATABASE_URL",url)
-    cfg=Config(str(Path(__file__).resolve().parents[1]/"alembic.ini"))
-    command.upgrade(cfg,"0008_plot_media")
-    eng=create_engine(url)
-    try:
-        with eng.begin() as conn:
-            conn.execute(text("INSERT INTO plots (id,project,plot_number,area_sqft,rate_per_sqft,status,x,y) VALUES (101,'Legacy','P1',1000,3000,'available',0,0),(102,' legacy ','p1',1200,4000,'sold',10,10),(103,'Legacy','P2',1500,3500,'available',20,20)"))
-            conn.execute(text("INSERT INTO plot_photos (plot_id,jpeg) VALUES (101,:image)"),{"image":b"retained-photo"})
-        command.upgrade(cfg,"head")
-        with eng.connect() as conn:
-            rows=conn.execute(text("SELECT id,project,plot_number,status,listing_state FROM plots ORDER BY id")).all()
-            assert rows==[(101,"Legacy","P1","available","conflict"),(102," legacy ","p1","sold","conflict"),(103,"Legacy","P2","available","published")]
-            assert conn.execute(text("SELECT jpeg FROM plot_photos WHERE plot_id=101")).scalar_one()==b"retained-photo"
-    finally:
-        eng.dispose()
-
-
-def test_admin_resolves_quarantined_inventory_without_deletion(client):
-    admin=login(client,"admin@example.com","TestAdminPass123!")
-    customer=register(client,"plot-review@example.com")
-    with m.SessionLocal() as db:
-        p=m.Plot(project="Legacy",plot_number="P1",area_sqft=1000,rate_per_sqft=3000,listing_state="conflict")
-        q=m.Plot(project="legacy",plot_number="p1",area_sqft=1200,rate_per_sqft=4000,listing_state="conflict")
-        db.add_all([p,q]);db.commit();ids=(p.id,q.id)
-    assert client.get("/api/plots").json()==[]
-    assert client.get("/api/admin/plots",headers=customer).status_code==403
-    assert len(client.get("/api/admin/plots",headers=admin).json())==2
-    data={"project":"Legacy","plot_number":"P1","area_sqft":1000,"rate_per_sqft":3000}
-    assert client.post("/api/plots",headers=admin,json=data).status_code==409
-    assert client.patch(f"/api/admin/plots/{ids[0]}",headers=admin,json=data).status_code==409
-    assert client.post(f"/api/admin/plots/{ids[1]}/archive",headers=customer).status_code==403
-    assert client.post(f"/api/admin/plots/{ids[1]}/archive",headers=admin).json()["listing_state"]=="archived"
-    assert client.get("/api/plots").json()==[]
-    assert client.patch(f"/api/admin/plots/{ids[0]}",headers=admin,json=data).json()["listing_state"]=="published"
-    assert [p["id"] for p in client.get("/api/plots").json()]==[ids[0]]
-    assert len(client.get("/api/admin/plots",headers=admin).json())==2
-    assert client.patch(f"/api/admin/plots/{ids[1]}",headers=admin,json=data).status_code==409

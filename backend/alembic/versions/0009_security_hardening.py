@@ -10,7 +10,8 @@ depends_on = None
 def upgrade():
     conn = op.get_bind()
     duplicate = conn.execute(sa.text("SELECT 1 FROM plots GROUP BY lower(trim(project)), lower(trim(plot_number)) HAVING count(*) > 1 LIMIT 1")).first()
-    # Historical duplicates are preserved for explicit review by the next migration.
+    if duplicate:
+        raise RuntimeError("Duplicate plot identifiers: reconcile existing records before migration")
     columns = {c["name"] for c in sa.inspect(conn).get_columns("admin_audit")}
     for name in ("before_values","after_values"):
         if name not in columns:
@@ -22,9 +23,8 @@ def upgrade():
         if name not in {x["name"] for x in sa.inspect(conn).get_check_constraints(table)}:
             with op.batch_alter_table(table) as batch:
                 batch.create_check_constraint(name,condition)
-    if not duplicate:
-        conn.execute(sa.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_plots_project_number_ci ON plots (lower(trim(project)), lower(trim(plot_number)))"))
     for ddl in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_plots_project_number_ci ON plots (lower(trim(project)), lower(trim(plot_number)))",
         "CREATE INDEX IF NOT EXISTS ix_plots_status ON plots (status)",
         "CREATE INDEX IF NOT EXISTS ix_leads_status_created_at ON leads (status, created_at)",
         "CREATE INDEX IF NOT EXISTS ix_support_customer_id_id ON support_messages (customer_id, id)",

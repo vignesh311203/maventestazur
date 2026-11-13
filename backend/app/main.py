@@ -136,14 +136,13 @@ class Lead(Base):
 
 class Plot(Base):
     __tablename__ = "plots"
-    __table_args__ = (Index("uq_plots_project_number_ci", text("lower(trim(project))"), text("lower(trim(plot_number))"), unique=True, postgresql_where=text("listing_state = 'published'"), sqlite_where=text("listing_state = 'published'")), CheckConstraint("listing_state IN ('published', 'conflict', 'archived')", name="ck_plots_listing_state"), Index("ix_plots_status", "status"), CheckConstraint("status IN ('available', 'reserved', 'sold')", name="ck_plots_status"))
+    __table_args__ = (Index("uq_plots_project_number_ci", text("lower(trim(project))"), text("lower(trim(plot_number))"), unique=True), Index("ix_plots_status", "status"), CheckConstraint("status IN ('available', 'reserved', 'sold')", name="ck_plots_status"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project: Mapped[str] = mapped_column(String(160), index=True)
     plot_number: Mapped[str] = mapped_column(String(40))
     area_sqft: Mapped[float] = mapped_column(Float)
     rate_per_sqft: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(20), default="available")
-    listing_state: Mapped[str] = mapped_column(String(20), default="published", server_default="published")
     x: Mapped[float] = mapped_column(Float, default=0)
     y: Mapped[float] = mapped_column(Float, default=0)
     location_label: Mapped[str] = mapped_column(String(255), default="", server_default="")
@@ -637,7 +636,7 @@ def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session)
 
 def plot_view(p: Plot, has_photo: bool) -> dict:
     return {"id": p.id, "project": p.project, "plot_number": p.plot_number,
-            "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status, "listing_state":p.listing_state,
+            "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "status": p.status,
             "x": p.x, "y": p.y, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude,
             "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent,
             "guidance_value": p.guidance_value, "width_ft": p.width_ft, "depth_ft": p.depth_ft,
@@ -673,24 +672,8 @@ def apply_plot_photo(db: Session, plot_id: int, data: PlotIn, jpeg):
 @app.get("/api/plots")
 def list_plots(db: Session = Depends(db_session)):
     photo_ids = set(db.scalars(select(PlotPhoto.plot_id)))
-    return [plot_view(p, p.id in photo_ids) for p in db.scalars(select(Plot).where(Plot.listing_state=="published").order_by(Plot.project, Plot.plot_number))]
+    return [plot_view(p, p.id in photo_ids) for p in db.scalars(select(Plot).order_by(Plot.project, Plot.plot_number))]
 
-
-@app.get("/api/admin/plots")
-def admin_list_plots(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
-    photo_ids = set(db.scalars(select(PlotPhoto.plot_id)))
-    return [plot_view(p,p.id in photo_ids) for p in db.scalars(select(Plot).order_by(Plot.project,Plot.plot_number,Plot.id))]
-
-def lock_plot_inventory(db):
-    if db.bind.dialect.name == "postgresql":
-        db.execute(text("SELECT pg_advisory_xact_lock(52403182)"))
-
-def assert_unique_plot_identity(db, project, number, exclude_id=None):
-    query=select(Plot.id).where(Plot.listing_state!="archived",func.lower(func.trim(Plot.project))==project.strip().lower(),func.lower(func.trim(Plot.plot_number))==number.strip().lower())
-    if exclude_id is not None:
-        query=query.where(Plot.id!=exclude_id)
-    if db.scalar(query.limit(1)) is not None:
-        raise HTTPException(status_code=409,detail="Plot identifier already exists. Resolve conflicting inventory in the Layout panel first.")
 
 @app.get("/api/plots/{plot_id}/photo")
 def get_plot_photo(plot_id: int, db: Session = Depends(db_session)):
@@ -703,8 +686,6 @@ def get_plot_photo(plot_id: int, db: Session = Depends(db_session)):
 @app.post("/api/plots", status_code=201)
 def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     jpeg = prepare_photo(data)
-    lock_plot_inventory(db)
-    assert_unique_plot_identity(db,data.project,data.plot_number)
     plot = Plot(**data.model_dump())
     db.add(plot)
     try:
@@ -799,7 +780,7 @@ def write_admin_audit(db: Session, actor: User, action: str, target: str = "", b
     db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160], before_values=before, after_values=after))
 
 def plot_audit_view(plot, has_photo):
-    return {"project":plot.project,"plot_number":plot.plot_number,"area_sqft":plot.area_sqft,"rate_per_sqft":plot.rate_per_sqft,"status":plot.status,"corner_plot":plot.corner_plot,"corner_premium_percent":plot.corner_premium_percent,"guidance_value":plot.guidance_value,"has_photo":has_photo,"listing_state":plot.listing_state}
+    return {"project":plot.project,"plot_number":plot.plot_number,"area_sqft":plot.area_sqft,"rate_per_sqft":plot.rate_per_sqft,"status":plot.status,"corner_plot":plot.corner_plot,"corner_premium_percent":plot.corner_premium_percent,"guidance_value":plot.guidance_value,"has_photo":has_photo}
 
 @app.get("/api/settings/calculator")
 def calculator_settings(db: Session = Depends(db_session)):
@@ -879,14 +860,10 @@ def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=D
 @app.patch("/api/admin/plots/{plot_id}")
 def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     jpeg = prepare_photo(data)
-    lock_plot_inventory(db)
     item=db.scalar(select(Plot).where(Plot.id==plot_id).with_for_update())
     if not item: raise HTTPException(status_code=404,detail="Plot not found")
-    if item.listing_state=="archived": raise HTTPException(status_code=409,detail="Archived duplicate records are retained for audit and cannot be edited")
     before = plot_audit_view(item, db.get(PlotPhoto,item.id) is not None)
-    assert_unique_plot_identity(db,data.project,data.plot_number,exclude_id=item.id)
     for key,value in data.model_dump(exclude_unset=True).items(): setattr(item,key,value)
-    item.listing_state="published"
     try:
         has_photo = apply_plot_photo(db, item.id, data, jpeg)
         write_admin_audit(db,user,"plot.updated",str(item.id),before,plot_audit_view(item,has_photo))
@@ -895,23 +872,6 @@ def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_sess
         db.rollback()
         raise HTTPException(status_code=409,detail="A plot with this project and plot number already exists") from None
     return plot_view(item, has_photo)
-
-@app.post("/api/admin/plots/{plot_id}/archive")
-def archive_duplicate_plot(plot_id:int, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    lock_plot_inventory(db)
-    item=db.scalar(select(Plot).where(Plot.id==plot_id).with_for_update())
-    if not item:
-        raise HTTPException(status_code=404,detail="Plot not found")
-    has_photo=db.get(PlotPhoto,item.id) is not None
-    if item.listing_state=="archived":
-        return plot_view(item,has_photo)
-    if item.listing_state!="conflict":
-        raise HTTPException(status_code=409,detail="Only conflicting legacy records can be archived here")
-    before=plot_audit_view(item,has_photo)
-    item.listing_state="archived"
-    write_admin_audit(db,user,"plot.conflict_archived",str(item.id),before,plot_audit_view(item,has_photo))
-    db.commit()
-    return plot_view(item,has_photo)
 
 @app.get("/api/admin/audit")
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
@@ -937,7 +897,7 @@ def plot_tool_handlers() -> dict:
                 "location": p.location_label, "corner_plot": p.corner_plot, "corner_premium_percent": p.corner_premium_percent}
     def search_plots(project=None, max_budget_inr=None, min_area_sqft=None, max_area_sqft=None):
         from math import isfinite
-        stmt = select(Plot).where(Plot.status == "available", Plot.listing_state == "published")
+        stmt = select(Plot).where(Plot.status == "available")
         if project:
             stmt = stmt.where(Plot.project.ilike("%" + str(project)[:80].replace("%", "").replace("_", "") + "%"))
         for column, raw, lower in ((Plot.area_sqft, min_area_sqft, True), (Plot.area_sqft, max_area_sqft, False), (Plot.area_sqft * Plot.rate_per_sqft, max_budget_inr, False)):
@@ -951,7 +911,7 @@ def plot_tool_handlers() -> dict:
             return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
     def plot_base_price(project, plot_number):
         with SessionLocal() as tool_db:
-            p = tool_db.scalar(select(Plot).where(Plot.status == "available", Plot.listing_state == "published", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
+            p = tool_db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
             return row(p) if p else {"error": "No available matching plot."}
     return {"search_plots": search_plots, "plot_base_price": plot_base_price}
 
@@ -1004,8 +964,8 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             if state is None:
                 state = ChatState(customer_id=customer_id, state={}, quick=list(MENU))
                 db.add(state)
-            projects = list(db.scalars(select(Plot.project).where(Plot.status == "available", Plot.listing_state == "published").distinct().order_by(Plot.project).limit(20)))
-            available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available", Plot.listing_state == "published")) or 0
+            projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
+            available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
             reply = respond(data.body, customer.full_name, state.state, projects, available)
             # Collect bounded public data and consented context; persist a fallback first.
             if data.ai_consent and ai_configured() and not reply.lead and reply.state == (state.state or {}):
@@ -1018,7 +978,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                 else:
                     from .ai_support import answer_question, eligible_question
                     if eligible_question(data.body):
-                        inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available", Plot.listing_state == "published").order_by(Plot.id).limit(40))]
+                        inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
                         ai_job = (answer_question, (data.body, inventory, settings.openai_api_key.get_secret_value(), settings.openai_model))
             state.state, state.quick = reply.state, reply.quick
             assistant = SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text)
