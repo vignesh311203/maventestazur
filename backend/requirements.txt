@@ -13,4 +13,4 @@ google-auth>=2.40,<3
 requests>=2.32.5,<3
 Pillow>=13.0,<14
 pyotp==2.9.0
-cryptography>=44,<50
+cryptography==50.0.0
