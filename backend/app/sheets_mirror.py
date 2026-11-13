@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 TABS = {
     "Leads": ["id", "created_at", "name", "phone", "email", "request_type", "source", "interest", "preferred_time", "status", "contact_consent_at"],
+    "Consent status": ["lead_id", "consent_at", "notice_version", "withdrawn_at"],
     "Messages": ["id", "created_at", "customer_id", "customer_name", "sender", "body"],
     "Plots": ["id", "project", "plot_number", "area_sqft", "rate_per_sqft", "total_price", "status", "map_x", "map_y"],
     "Referrals": ["id", "partner_id", "partner_name", "referred_name", "referred_phone", "status", "reward_amount"],

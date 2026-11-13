@@ -527,14 +527,13 @@ def current_user(request: Request, credentials: HTTPAuthorizationCredentials | N
     return user
 
 def require_roles(*roles: Role):
-    def dependency(user: User = Depends(current_user)) -> User:
+    def dependency(user: User = Depends(current_user), db: Session = Depends(db_session)) -> User:
         if user.role not in [r.value for r in roles]: raise HTTPException(status_code=403, detail="Insufficient permissions")
         if user.role == Role.admin.value and settings.admin_mfa_required:
             # Existing administrators may enroll via the dedicated setup endpoints.
-            with SessionLocal() as check_db:
-                factor = check_db.get(AdminMfa, user.id)
-                if not factor or not factor.enabled:
-                    raise HTTPException(status_code=403, detail="Set up administrator MFA under Account security before using this feature")
+            factor = db.get(AdminMfa, user.id)
+            if not factor or not factor.enabled:
+                raise HTTPException(status_code=403, detail="Set up administrator MFA under Account security before using this feature")
         return user
     return dependency
 
@@ -1140,7 +1139,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
     key = sender + ":" + data.client_id
     existing = db.scalar(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.client_id == key))
     if existing:
-        if existing.body != data.body or (sender=="customer" and bool(existing.ai_consent_at)!=data.ai_consent):
+        if existing.body != data.body:
             raise HTTPException(status_code=409, detail="Message request ID already used")
         return support_view(existing)
     item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body,
@@ -1229,6 +1228,7 @@ class PrivacyDecisionIn(BaseModel):
     current_password: str = Field(min_length=1,max_length=128)
     retention_reviewed: bool = False
     external_copies_reviewed: bool = False
+    erasure_confirmation: str = Field(default="", max_length=30)
 
 @app.get("/api/customer/privacy/requests")
 def own_privacy_requests(db: Session=Depends(db_session), user: User=Depends(require_roles(Role.customer))):
@@ -1291,6 +1291,7 @@ def admin_privacy_requests(status: Literal["open","all"]="open",limit: int=Query
 @app.patch("/api/admin/privacy/requests/{request_id}")
 @limiter.limit("5/minute")
 def admin_privacy_decision(request: Request,request_id:int,data: PrivacyDecisionIn,db: Session=Depends(db_session),user: User=Depends(require_roles(Role.admin))):
+    user = lock_active_user(db,user)
     confirm_password(user,data.current_password)
     item=db.scalar(select(PrivacyRequest).where(PrivacyRequest.id==request_id).with_for_update())
     if not item:
@@ -1299,7 +1300,7 @@ def admin_privacy_decision(request: Request,request_id:int,data: PrivacyDecision
         raise HTTPException(status_code=409,detail="This request is already closed")
     before={"status":item.status}
     if data.decision=="erase_application":
-        if item.kind!="erasure" or item.status!="in_review" or not data.retention_reviewed or not data.external_copies_reviewed:
+        if item.kind!="erasure" or item.status!="in_review" or not data.retention_reviewed or not data.external_copies_reviewed or data.erasure_confirmation!="ERASE ACCOUNT":
             raise HTTPException(status_code=422,detail="Review the erasure request, legal retention obligations and external copies first")
         customer=db.scalar(select(User).where(User.id==item.customer_id).with_for_update().execution_options(populate_existing=True))
         if not customer or customer.role!=Role.customer.value or customer.erased_at:

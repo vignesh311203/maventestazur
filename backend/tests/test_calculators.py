@@ -1025,6 +1025,11 @@ def test_customer_privacy_export_and_erasure_scope(client):
     pw={"current_password":"TestCustomerPass123!"}
     assert client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"withdraw_contact"}).json()["status"]=="resolved"
     assert client.get("/api/customer/privacy/export",headers=owner).json()["enquiries"][0]["contact_consent_withdrawn_at"]
+    from app.sheet_sync import snapshot
+    with m.SessionLocal() as db:
+        report=snapshot(db,external=True,full_customer_data=True)
+        withdrawn=next(x for x in report["Consent status"] if x["withdrawn_at"])
+        assert next(x for x in report["Leads"] if x["id"]==withdrawn["lead_id"])["phone"]==""
     req=client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"erasure"}).json()
     assert req["status"]=="pending"
     assert client.post("/api/customer/privacy/requests",headers=owner,json={**pw,"kind":"erasure"}).json()["id"]==req["id"]
@@ -1035,7 +1040,7 @@ def test_customer_privacy_export_and_erasure_scope(client):
     assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application"}).status_code==422
     assert client.patch(url,headers=admin,json={**adm,"decision":"in_review"}).json()["status"]=="in_review"
     assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application","retention_reviewed":True}).status_code==422
-    assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application","retention_reviewed":True,"external_copies_reviewed":True}).json()["status"]=="erased"
+    assert client.patch(url,headers=admin,json={**adm,"decision":"erase_application","retention_reviewed":True,"external_copies_reviewed":True,"erasure_confirmation":"ERASE ACCOUNT"}).json()["status"]=="erased"
     assert client.get("/api/customer/privacy/export",headers=owner).status_code==401
     assert client.get("/api/customer/privacy/export",headers=other).json()["enquiries"][0]["interest"]=="Other private enquiry"
     with m.SessionLocal() as db:
