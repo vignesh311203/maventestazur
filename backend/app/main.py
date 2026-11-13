@@ -5,6 +5,13 @@ from .finance import router as finance_router
 from enum import Enum
 from typing import Generator, Literal
 from math import expm1, log1p
+from contextlib import asynccontextmanager
+import logging
+import time
+import uuid
+from limits import parse
+from starlette.concurrency import run_in_threadpool
+from .request_security import client_ip, account_key
 import jwt
 import hashlib
 import hmac
@@ -20,13 +27,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, Index, CheckConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 class Settings(BaseSettings):
     app_env: str = "development"
@@ -36,6 +42,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     redis_url: str = ""
     trusted_hosts: str = "localhost,127.0.0.1,testserver"
+    client_ip_mode: Literal["socket", "railway"] = "socket"
+    public_base_url: str = ""
+    external_full_customer_reports: bool = False
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     ai_enabled: bool = False
@@ -83,6 +92,7 @@ class Role(str, Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (CheckConstraint("role IN ('admin', 'agent', 'partner', 'customer')", name="ck_users_role"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(160))
@@ -107,6 +117,7 @@ class ReportDestination(Base):
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (Index("ix_leads_status_created_at", "status", "created_at"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(160))
@@ -125,6 +136,7 @@ class Lead(Base):
 
 class Plot(Base):
     __tablename__ = "plots"
+    __table_args__ = (Index("uq_plots_project_number_ci", text("lower(trim(project))"), text("lower(trim(plot_number))"), unique=True), Index("ix_plots_status", "status"), CheckConstraint("status IN ('available', 'reserved', 'sold')", name="ck_plots_status"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project: Mapped[str] = mapped_column(String(160), index=True)
     plot_number: Mapped[str] = mapped_column(String(40))
@@ -173,7 +185,7 @@ class ReviewRequest(Base):
 
 class SupportMessage(Base):
     __tablename__ = "support_messages"
-    __table_args__ = (UniqueConstraint("customer_id", "client_id", name="uq_support_customer_client"),)
+    __table_args__ = (UniqueConstraint("customer_id", "client_id", name="uq_support_customer_client"), Index("ix_support_customer_id_id", "customer_id", "id"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     sender: Mapped[str] = mapped_column(String(16))
@@ -192,8 +204,23 @@ class ChatState(Base):
 password_hash = PasswordHash.recommended()
 _dummy_password_hash = password_hash.hash(secrets.token_urlsafe(32))
 bearer = HTTPBearer(auto_error=False)
-limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
-app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
+logger = logging.getLogger("uvicorn.error")
+def rate_key(request: Request):
+    return client_ip(request, settings.client_ip_mode, settings.trusted_hosts)
+
+limiter = Limiter(key_func=rate_key, storage_uri=settings.redis_url or "memory://")
+
+@asynccontextmanager
+async def lifespan(application):
+    bootstrap_admin()
+    seed_business_settings()
+    start_sheets_worker()
+    try:
+        yield
+    finally:
+        stop_sheets_worker()
+
+app = FastAPI(lifespan=lifespan, title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
 app.include_router(finance_router)
 app.state.limiter = limiter
 if settings.app_env == "production":
@@ -204,6 +231,39 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]})
 app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-Session-Panel"])
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    response = None
+    try:
+        if request.url.path.startswith("/api/") and request.method != "OPTIONS":
+            def permitted():
+                key = rate_key(request)
+                if not limiter._limiter.hit(parse("300/minute"), "api-global", key):
+                    return False
+                if request.url.path.startswith(("/api/finance/", "/api/calculators/")):
+                    return limiter._limiter.hit(parse("60/minute"), "finance", key)
+                return True
+            try:
+                allowed = await run_in_threadpool(permitted)
+            except Exception:
+                logger.error("rate_limit_unavailable request_id=%s", request_id)
+                response = JSONResponse(status_code=503, content={"detail":"Service temporarily unavailable"}, headers={"Cache-Control":"no-store"})
+            else:
+                if not allowed:
+                    response = JSONResponse(status_code=429, content={"detail":"Too many requests. Try again shortly."}, headers={"Retry-After":"60","Cache-Control":"no-store"})
+        if response is None:
+            response = await call_next(request)
+    except Exception as exc:
+        logger.error("request_failed request_id=%s error_type=%s", request_id, type(exc).__name__)
+        raise
+    response.headers["X-Request-ID"] = request_id
+    route = request.scope.get("route")
+    route_name = getattr(route, "path", "unmatched")
+    logger.info("request_id=%s method=%s route=%s status=%s duration_ms=%.1f", request_id, request.method, route_name, response.status_code, (time.monotonic()-started)*1000)
+    return response
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -318,6 +378,14 @@ class PlotIn(BaseModel):
     road_width_ft: float | None = Field(default=None, gt=0, le=1000)
     photo_data: str | None = Field(default=None, max_length=2796204, exclude=True)
     remove_photo: bool = Field(default=False, exclude=True)
+
+    @field_validator("project", "plot_number")
+    @classmethod
+    def normalize_plot_label(cls, value):
+        value = value.strip()
+        if not value or any(ord(c) < 32 for c in value):
+            raise ValueError("Enter a valid project and plot number")
+        return value
 
     @model_validator(mode="after")
     def validate_location(self):
@@ -457,6 +525,9 @@ def register(data: RegisterIn, request: Request, response: Response, db: Session
 @limiter.limit("10/minute")
 def login(data: LoginIn, request: Request, response: Response, db: Session = Depends(db_session)):
     browser_panel(request)
+    key = account_key(settings.app_secret_key, str(data.email))
+    if not limiter._limiter.hit(parse("10/15 minutes"), "login-account", key):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in 15 minutes.", headers={"Retry-After":"900"})
     user = db.scalar(select(User).where(User.email == data.email.lower()))
     valid = password_hash.verify(data.password, user.password_hash if user else _dummy_password_hash)
     if not user or not valid or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -518,7 +589,12 @@ def create_lead(data: LeadIn, request: Request, db: Session = Depends(db_session
     lead = Lead(owner_id=user.id, name=user.full_name if user.role == Role.customer.value else data.name.strip(), phone=data.phone.strip(),
                 email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip(),
                 source="customer" if user.role == Role.customer.value else "admin", contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
-    db.add(lead); db.commit(); db.refresh(lead)
+    db.add(lead)
+    db.flush()
+    if user.role == Role.admin.value:
+        write_admin_audit(db, user, "lead.created", str(lead.id), None, {"status":lead.status,"source":lead.source})
+    db.commit()
+    db.refresh(lead)
     return {"id": lead.id, "status": lead.status}
 
 @app.post("/api/public/enquiries", status_code=201)
@@ -550,9 +626,12 @@ def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
 @app.patch("/api/leads/{lead_id}/status")
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
-    lead = db.get(Lead, lead_id)
+    lead = db.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
     if not lead: raise HTTPException(status_code=404, detail="Lead not found")
-    lead.status = new_status; db.commit()
+    before = {"status": lead.status}
+    lead.status = new_status
+    write_admin_audit(db, user, "lead.status_changed", str(lead.id), before, {"status":new_status})
+    db.commit()
     return {"id": lead.id, "status": lead.status}
 
 def plot_view(p: Plot, has_photo: bool) -> dict:
@@ -609,9 +688,14 @@ def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depen
     jpeg = prepare_photo(data)
     plot = Plot(**data.model_dump())
     db.add(plot)
-    db.flush()
-    has_photo = apply_plot_photo(db, plot.id, data, jpeg)
-    db.commit()
+    try:
+        db.flush()
+        has_photo = apply_plot_photo(db, plot.id, data, jpeg)
+        write_admin_audit(db, user, "plot.created", str(plot.id), None, plot_audit_view(plot, has_photo))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A plot with this project and plot number already exists") from None
     db.refresh(plot)
     return plot_view(plot, has_photo)
 
@@ -634,7 +718,11 @@ def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User
     customer = db.get(User, data.customer_id)
     if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item)
+    db.flush()
+    write_admin_audit(db, user, "review.requested", str(item.id), None, {"customer_id":customer.id,"channel":item.channel,"consent_confirmed":True})
+    db.commit()
+    db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
 
 @app.get("/api/customer/portal")
@@ -642,7 +730,6 @@ def customer_portal(db: Session = Depends(db_session), user: User = Depends(requ
     refs = list(db.scalars(select(Referral).where(Referral.referrer_id == user.id)))
     return {"profile": {"id": user.id, "name": user.full_name, "email": user.email}, "referrals": [{"id": r.id, "status": r.status} for r in refs], "message": "Booking, payment and document records require verified business-system integration"}
 
-@app.on_event("startup")
 def bootstrap_admin():
     if not settings.bootstrap_admin_email or not settings.bootstrap_admin_password: return
     with SessionLocal() as db:
@@ -666,6 +753,8 @@ class AdminAudit(Base):
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     action: Mapped[str] = mapped_column(String(100))
     target: Mapped[str] = mapped_column(String(160), default="")
+    before_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 DEFAULT_SETTINGS = {"registration_percent":"2.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
@@ -686,9 +775,12 @@ class ReferralDecisionIn(BaseModel):
 class PlotUpdateIn(PlotIn):
     pass
 
-def write_admin_audit(db: Session, actor: User, action: str, target: str = ""):
-    db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160]))
-    db.commit()
+def write_admin_audit(db: Session, actor: User, action: str, target: str = "", before=None, after=None):
+    """Stage audit changes in the caller's transaction. Never store credentials or chat text."""
+    db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160], before_values=before, after_values=after))
+
+def plot_audit_view(plot, has_photo):
+    return {"project":plot.project,"plot_number":plot.plot_number,"area_sqft":plot.area_sqft,"rate_per_sqft":plot.rate_per_sqft,"status":plot.status,"corner_plot":plot.corner_plot,"corner_premium_percent":plot.corner_premium_percent,"guidance_value":plot.guidance_value,"has_photo":has_photo}
 
 @app.get("/api/settings/calculator")
 def calculator_settings(db: Session = Depends(db_session)):
@@ -702,12 +794,13 @@ def admin_get_settings(db: Session = Depends(db_session), user: User = Depends(r
 
 @app.patch("/api/admin/settings")
 def admin_update_settings(data: AdminSettingsIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    before = admin_get_settings(db, user)
     for key,value in data.model_dump().items():
-        row = db.scalar(select(AppSetting).where(AppSetting.key==key))
+        row = db.scalar(select(AppSetting).where(AppSetting.key==key).with_for_update())
         if row: row.value=str(value)
         else: db.add(AppSetting(key=key,value=str(value)))
+    write_admin_audit(db,user,"settings.updated",",".join(data.model_fields_set),before,data.model_dump())
     db.commit()
-    write_admin_audit(db,user,"settings.updated",",".join(data.model_fields_set))
     return data.model_dump()
 
 @app.get("/api/admin/users")
@@ -720,24 +813,27 @@ def admin_create_user(data: AdminUserIn, db: Session = Depends(db_session), user
     if db.scalar(select(User).where(User.email==email)): raise HTTPException(status_code=409,detail="Email already registered")
     created=User(email=email,full_name=data.full_name.strip(),password_hash=password_hash.hash(data.password),role=data.role.value)
     db.add(created)
-    try: db.commit()
+    try:
+        db.flush()
+        write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}",None,{"role":created.role,"is_active":created.is_active})
+        db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Email already registered") from None
     db.refresh(created)
-    write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}")
     return {"id":created.id,"email":created.email,"full_name":created.full_name,"role":created.role,"is_active":created.is_active}
 
 @app.patch("/api/admin/users/{user_id}/active")
 def admin_set_user_active(user_id:int, active:bool, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    target=db.get(User,user_id)
+    target=db.scalar(select(User).where(User.id==user_id).with_for_update())
     if not target: raise HTTPException(status_code=404,detail="User not found")
     if target.id==user.id and not active: raise HTTPException(status_code=400,detail="You cannot deactivate your own account")
+    before = {"is_active":target.is_active}
     target.is_active=active
     if not active:
         db.execute(delete(AuthSession).where(AuthSession.user_id == target.id))
+    write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}",before,{"is_active":active})
     db.commit()
-    write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}")
     return {"id":target.id,"is_active":target.is_active}
 
 @app.get("/api/admin/referrals")
@@ -746,32 +842,41 @@ def admin_list_referrals(db:Session=Depends(db_session), user:User=Depends(requi
 
 @app.patch("/api/admin/referrals/{referral_id}")
 def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    item=db.get(Referral,referral_id)
+    item=db.scalar(select(Referral).where(Referral.id==referral_id).with_for_update())
     if not item: raise HTTPException(status_code=404,detail="Referral not found")
     if item.status == "paid" and (data.status != "paid" or data.reward_amount != item.reward_amount):
         raise HTTPException(status_code=409, detail="Paid reward records cannot be changed")
     if data.status == "paid" and (item.status not in {"approved", "paid"} or data.reward_amount != item.reward_amount):
         raise HTTPException(status_code=409, detail="Approve the reward before recording its verified payment")
-    item.status=data.status; item.reward_amount=data.reward_amount; db.commit()
-    write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}")
+    if item.status == "paid":
+        return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
+    before = {"status":item.status,"reward_amount":item.reward_amount}
+    item.status=data.status
+    item.reward_amount=data.reward_amount
+    write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}",before,{"status":item.status,"reward_amount":item.reward_amount})
+    db.commit()
     return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
 
 @app.patch("/api/admin/plots/{plot_id}")
 def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    item=db.get(Plot,plot_id)
-    if not item: raise HTTPException(status_code=404,detail="Plot not found")
     jpeg = prepare_photo(data)
+    item=db.scalar(select(Plot).where(Plot.id==plot_id).with_for_update())
+    if not item: raise HTTPException(status_code=404,detail="Plot not found")
+    before = plot_audit_view(item, db.get(PlotPhoto,item.id) is not None)
     for key,value in data.model_dump(exclude_unset=True).items(): setattr(item,key,value)
-    has_photo = apply_plot_photo(db, item.id, data, jpeg)
-    db.commit()
-    write_admin_audit(db,user,"plot.updated",str(item.id))
+    try:
+        has_photo = apply_plot_photo(db, item.id, data, jpeg)
+        write_admin_audit(db,user,"plot.updated",str(item.id),before,plot_audit_view(item,has_photo))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409,detail="A plot with this project and plot number already exists") from None
     return plot_view(item, has_photo)
 
 @app.get("/api/admin/audit")
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
+    return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"before":x.before_values,"after":x.after_values,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
 
-@app.on_event("startup")
 def seed_business_settings():
     with SessionLocal() as db:
         for key,value in DEFAULT_SETTINGS.items():
@@ -785,7 +890,7 @@ def ai_configured() -> bool:
     return bool(settings.ai_enabled and key.get_secret_value())
 
 
-def plot_tool_handlers(db: Session) -> dict:
+def plot_tool_handlers() -> dict:
     def row(p):
         return {"project": p.project, "plot_number": p.plot_number, "area_sqft": p.area_sqft,
                 "rate_per_sqft": p.rate_per_sqft, "base_price_inr": round(p.area_sqft * p.rate_per_sqft, 2),
@@ -801,11 +906,13 @@ def plot_tool_handlers(db: Session) -> dict:
                 if not isfinite(n) or n < 0:
                     raise ValueError("Use finite nonnegative search bounds")
                 stmt = stmt.where(column >= n if lower else column <= n)
-        rows = list(db.scalars(stmt.order_by(Plot.area_sqft * Plot.rate_per_sqft, Plot.id).limit(8)))
-        return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
+        with SessionLocal() as tool_db:
+            rows = list(tool_db.scalars(stmt.order_by(Plot.area_sqft * Plot.rate_per_sqft, Plot.id).limit(8)))
+            return {"count": len(rows), "plots": [row(p) for p in rows], "note": "Base prices exclude corner premiums, taxes and registration."}
     def plot_base_price(project, plot_number):
-        p = db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
-        return row(p) if p else {"error": "No available matching plot."}
+        with SessionLocal() as tool_db:
+            p = tool_db.scalar(select(Plot).where(Plot.status == "available", func.lower(Plot.project) == str(project).strip().lower(), func.lower(Plot.plot_number) == str(plot_number).strip().lower()).order_by(Plot.id).limit(1))
+            return row(p) if p else {"error": "No available matching plot."}
     return {"search_plots": search_plots, "plot_base_price": plot_base_price}
 
 
@@ -848,6 +955,8 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
         return support_view(existing)
     item = SupportMessage(customer_id=customer_id, sender=sender, client_id=key, body=data.body)
     db.add(item)
+    ai_job = None
+    assistant = None
     try:
         db.flush()
         if sender == "customer":
@@ -858,26 +967,22 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
             projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
             reply = respond(data.body, customer.full_name, state.state, projects, available)
-            # The model can answer questions, never create a lead or alter slots.
+            # Collect bounded public data and consented context; persist a fallback first.
             if data.ai_consent and ai_configured() and not reply.lead and reply.state == (state.state or {}):
-                ai_text = None
                 if settings.ai_provider == "anthropic":
                     from .agent_ai import converse, agent_eligible
                     if agent_eligible(data.body):
                         recent = list(db.scalars(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.sender.in_(["customer", "assistant"])).order_by(SupportMessage.id.desc()).limit(14)))
                         history = [{"sender": x.sender, "body": x.body} for x in reversed(recent)]
-                        ai_text = converse(history, plot_tool_handlers(db), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name)
+                        ai_job = (converse, (history, plot_tool_handlers(), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name))
                 else:
                     from .ai_support import answer_question, eligible_question
                     if eligible_question(data.body):
-                        public_plots = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
-                        ai_text = answer_question(data.body, public_plots, settings.openai_api_key.get_secret_value(), settings.openai_model)
-                if ai_text:
-                    if reply.state.get("flow"):
-                        ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
-                    reply.text = ai_text
+                        inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
+                        ai_job = (answer_question, (data.body, inventory, settings.openai_api_key.get_secret_value(), settings.openai_model))
             state.state, state.quick = reply.state, reply.quick
-            db.add(SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text))
+            assistant = SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text)
+            db.add(assistant)
             if reply.lead:
                 data_lead = reply.lead
                 db.add(Lead(owner_id=customer_id, name=customer.full_name, email=customer.email,
@@ -893,7 +998,28 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
         if not existing or existing.body != data.body:
             raise HTTPException(status_code=409, detail="Message request conflict")
         return support_view(existing)
-    return support_view(item)
+    result = support_view(item)
+    if ai_job and assistant is not None:
+        assistant_id = assistant.id
+        # Release the user lock and pool connection before provider network I/O.
+        db.close()
+        try:
+            fn, args = ai_job
+            ai_text = fn(*args)
+        except Exception as exc:
+            logger.warning("ai_advisor_failed error_type=%s", type(exc).__name__)
+            ai_text = None
+        if ai_text:
+            if reply.state.get("flow"):
+                ai_text += "\n\nBack to your request: " + reply.text.split("Back to your request: ")[-1].split("Let's continue. ")[-1]
+            with SessionLocal() as update_db:
+                active = update_db.scalar(select(User).where(User.id == customer_id).with_for_update())
+                latest = update_db.scalar(select(func.max(SupportMessage.id)).where(SupportMessage.customer_id == customer_id))
+                saved = update_db.get(SupportMessage, assistant_id)
+                if active and active.is_active and latest == assistant_id and saved and saved.body == reply.text:
+                    saved.body = ai_text[:2000]
+                    update_db.commit()
+    return result
 
 
 @app.get("/api/customer/chat-state")
@@ -1024,7 +1150,7 @@ def email_report(request: Request, data: ReportSendIn, db: Session = Depends(db_
     destination = reporting_config(db)
     if not destination["email"] or not email_ready(settings):
         raise HTTPException(status_code=409, detail="Configure the reporting email and SMTP provider first")
-    archive = export_zip(snapshot(db))
+    archive = export_zip(snapshot(db, external=True, full_customer_data=settings.external_full_customer_reports))
     if len(archive) > 10_000_000:
         raise HTTPException(status_code=413, detail="Report is too large for email. Download it privately instead.")
     try:
@@ -1064,14 +1190,12 @@ def export_reporting_data(request: Request, db: Session = Depends(db_session), u
     return Response(export_zip(snapshot(db)), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="metroestate-private-report.zip"'})
 
 
-@app.on_event("startup")
 def start_sheets_worker():
     from . import main
     from .sheet_sync import start_worker
     app.state.sheet_stop, app.state.sheet_worker = start_worker(main)
 
 
-@app.on_event("shutdown")
 def stop_sheets_worker():
     stop = getattr(app.state, "sheet_stop", None)
     worker = getattr(app.state, "sheet_worker", None)

@@ -13,7 +13,16 @@ def eligible_question(body):
 def safe_question(body):
     # Opt-in required; redaction is not a guarantee of removing all personal data.
     body = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email removed]", body)
-    body = re.sub(r"(?<!\w)\+?\d[\d .()-]{6,20}\d(?!\w)", "[number removed]", body)
+    # Preserve ordinary numeric budgets; redact explicit international numbers,
+    # Indian mobile shapes and labelled contact numbers. This is not anonymization.
+    body = re.sub(r"(?<!\w)\+\d[\d ()-]{6,18}\d(?!\w)", "[number removed]", body)
+    def mobile(match):
+        prefix = body[max(0,match.start()-32):match.start()]
+        if re.search(r"(?:₹|rs\.?|inr|budget|price|cost|amount|loan)\s*[:=]?\s*$",prefix,re.I):
+            return match.group(0)
+        return "[number removed]"
+    body = re.sub(r"(?<![\w,])(?:0?91[ -]?)?[6-9](?:[ -]?\d){9}(?![\w,])", mobile, body)
+    body = re.sub(r"(?i)(\b(?:phone|mobile|contact|call|whatsapp)(?: number)?\s*[:=]?\s*)\d[\d ()-]{5,18}\d", r"\1[number removed]", body)
     return body[:1200]
 
 def answer_question(body, inventory, api_key, model, post=None):

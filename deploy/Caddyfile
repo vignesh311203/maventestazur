@@ -8,7 +8,7 @@
         -Server
     }
     request_body {
-        max_size 1MB
+        max_size 3MB
     }
     @api path /api/* /health /ready
     handle @api {

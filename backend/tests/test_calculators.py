@@ -20,9 +20,13 @@ from app import main as m
 
 @pytest.fixture
 def client(monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    engine = create_engine(pg_url) if pg_url else create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    if pg_url:
+        m.Base.metadata.drop_all(engine)
     m.Base.metadata.create_all(engine)
     monkeypatch.setattr(m, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False))
+    monkeypatch.setattr(m, "engine", engine)
     monkeypatch.setattr(m.settings, "bootstrap_admin_email", "admin@example.com")
     monkeypatch.setattr(m.settings, "bootstrap_admin_password", "TestAdminPass123!")
     m.limiter.reset()
@@ -30,6 +34,8 @@ def client(monkeypatch):
         with TestClient(m.app) as c:
             yield c
     finally:
+        if pg_url:
+            m.Base.metadata.drop_all(engine)
         engine.dispose()
 
 def login(client, email, password):
@@ -223,7 +229,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_plot_media"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_security_hardening"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -471,7 +477,7 @@ def test_sheet_reporting_privacy_queue_and_retry(client, monkeypatch):
         def __init__(self, *args): pass
         def sync(self, data):
             assert set(data) == set(TABS)
-            assert data["Messages"][0]["body"] == "=1+1"
+            assert data["Messages"][0]["body"] == ""
             assert len(data["Customers"]) == 2
         def close(self): pass
     assert process_once(m, GoodMirror) == "synced"
@@ -809,3 +815,96 @@ def test_advisor_consent_and_customer_isolation(client,monkeypatch):
     assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="A plot fits your budget."
     assert send("Book Site Visit",3,True).status_code==201
     assert len(seen)==1
+
+
+def test_duplicate_plot_and_atomic_audit(client, monkeypatch):
+    admin = login(client,"admin@example.com","TestAdminPass123!")
+    data={"project":"Unique Enclave","plot_number":"P1","area_sqft":1200,"rate_per_sqft":3500}
+    result=client.post("/api/plots",headers=admin,json=data)
+    assert result.status_code==201,result.text
+    pid=result.json()["id"]
+    assert client.post("/api/plots",headers=admin,json={**data,"project":" unique enclave ","plot_number":"p1"}).status_code==409
+    assert client.patch(f"/api/admin/plots/{pid}",headers=admin,json={**data,"rate_per_sqft":3600}).status_code==200
+    audit=client.get("/api/admin/audit",headers=admin).json()
+    change=next(x for x in audit if x["action"]=="plot.updated")
+    assert change["before"]["rate_per_sqft"]==3500 and change["after"]["rate_per_sqft"]==3600
+    original=m.write_admin_audit
+    def fail_audit(*args,**kwargs):
+        raise RuntimeError("Simulated audit failure")
+    monkeypatch.setattr(m,"write_admin_audit",fail_audit)
+    with pytest.raises(RuntimeError):
+        client.post("/api/plots",headers=admin,json={**data,"plot_number":"P2"})
+    monkeypatch.setattr(m,"write_admin_audit",original)
+    assert len(client.get("/api/plots").json())==1
+
+
+def test_referral_paid_idempotent_and_audited(client):
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    _,partner=make_user(client,admin,"referral-lock@example.com","partner")
+    rid=client.post("/api/partners/referrals",headers=partner,json={"referred_name":"Test Referral","referred_phone":"9999999999"}).json()["id"]
+    url=f"/api/admin/referrals/{rid}"
+    assert client.patch(url,headers=admin,json={"status":"approved","reward_amount":1000}).status_code==200
+    for _ in range(2):
+        assert client.patch(url,headers=admin,json={"status":"paid","reward_amount":1000}).status_code==200
+    records=[x for x in client.get("/api/admin/audit",headers=admin).json() if x["action"]=="referral.decision"]
+    assert len(records)==2 and records[0]["before"]["status"]=="approved" and records[0]["after"]["status"]=="paid"
+    assert client.patch(url,headers=admin,json={"status":"paid","reward_amount":2000}).status_code==409
+
+
+def test_proxy_account_throttle_and_request_ids(client,monkeypatch):
+    from starlette.requests import Request
+    from app.request_security import client_ip
+    scope={"type":"http","client":("127.0.0.1",5000),"headers":[(b"host",b"testserver"),(b"x-real-ip",b"203.0.113.10"),(b"x-forwarded-for",b"1.2.3.4")]}
+    assert client_ip(Request(scope),"socket","testserver")=="127.0.0.1"
+    assert client_ip(Request(scope),"railway","testserver")=="203.0.113.10"
+    monkeypatch.setattr(m.settings,"client_ip_mode","railway")
+    for i in range(10):
+        res=client.post("/api/auth/login",headers={"X-Real-IP":f"203.0.113.{i+1}"},json={"email":"unknown@example.com","password":"wrong"})
+        assert res.status_code==401
+    res=client.post("/api/auth/login",headers={"X-Real-IP":"203.0.113.50"},json={"email":"unknown@example.com","password":"wrong"})
+    assert res.status_code==429 and res.headers["retry-after"]=="900"
+    assert len(res.headers["x-request-id"])==32
+    assert client.post("/api/auth/login",headers={"X-Real-IP":"203.0.113.50"},json={"email":"admin@example.com","password":"TestAdminPass123!"}).status_code==200
+
+
+def test_budget_redaction_preserves_money():
+    from app.ai_support import safe_question
+    assert "50000000" in safe_question("budget 50000000")
+    assert "45,00,000" in safe_question("price 45,00,000")
+    assert "9999999999" not in safe_question("call me at 9999999999")
+    assert "+91 9876543210" not in safe_question("phone +91 9876543210")
+
+
+def test_external_reporting_minimization(client):
+    from app.sheet_sync import snapshot
+    customer=register(client,"private-report@example.com")
+    client.post("/api/customer/messages",headers=customer,json={"body":"private customer message","client_id":"private-report-12345"})
+    with m.SessionLocal() as db:
+        full=snapshot(db)
+        external=snapshot(db,external=True)
+        assert full["Customers"][0]["email"]=="private-report@example.com"
+        assert external["Customers"][0]["email"]==""
+        assert external["Messages"][0]["body"]==""
+        assert snapshot(db,external=True,full_customer_data=True)["Messages"][0]["body"]=="private customer message"
+
+
+def test_ai_fallback_committed_before_provider(client,monkeypatch):
+    from pydantic import SecretStr
+    from sqlalchemy import select
+    from app import ai_support
+    customer=register(client,"ai-commit@example.com")
+    monkeypatch.setattr(m.settings,"ai_enabled",True)
+    monkeypatch.setattr(m.settings,"openai_api_key",SecretStr("test-key-not-real"))
+    calls=[]
+    def answer(*args):
+        with m.SessionLocal() as independent:
+            rows=list(independent.scalars(select(m.SupportMessage).order_by(m.SupportMessage.id)))
+            assert len(rows)==2 and rows[0].body=="How do loans work?"
+        calls.append(True)
+        return "Loan explanation."
+    monkeypatch.setattr(ai_support,"answer_question",answer)
+    body={"body":"How do loans work?","client_id":"ai-commit-test-1234","ai_consent":True}
+    assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
+    assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
+    assert len(calls)==1
+    assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="Loan explanation."

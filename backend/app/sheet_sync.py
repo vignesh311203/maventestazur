@@ -13,7 +13,7 @@ def now():
 def iso(value):
     return value.isoformat() if value else ""
 
-def snapshot(db):
+def snapshot(db, external=False, full_customer_data=False):
     from . import main as m
     photo_ids = set(db.scalars(select(m.PlotPhoto.plot_id)))
     users = {u.id: u for u in db.scalars(select(m.User).order_by(m.User.id))}
@@ -29,7 +29,7 @@ def snapshot(db):
             stats[3] += referral.reward_amount
     def name(uid):
         return users[uid].full_name if uid in users else ""
-    return {
+    data = {
         "Leads": [{"id": x.id, "created_at": iso(x.created_at), "name": x.name, "phone": x.phone, "email": x.email, "request_type": x.request_type, "source": x.source, "interest": x.interest, "preferred_time": x.preferred_time, "status": x.status, "contact_consent_at": iso(x.contact_consent_at)} for x in db.scalars(select(m.Lead).order_by(m.Lead.id))],
         "Messages": [{"id": x.id, "created_at": iso(x.created_at), "customer_id": x.customer_id, "customer_name": name(x.customer_id), "sender": x.sender, "body": x.body} for x in db.scalars(select(m.SupportMessage).order_by(m.SupportMessage.id))],
         "Plots": [{"id": x.id, "project": x.project, "plot_number": x.plot_number, "area_sqft": x.area_sqft, "rate_per_sqft": x.rate_per_sqft, "total_price": round(x.area_sqft * x.rate_per_sqft, 2), "status": x.status, "map_x": x.x, "map_y": x.y, "location_label": x.location_label, "latitude": x.latitude, "longitude": x.longitude} for x in db.scalars(select(m.Plot).order_by(m.Plot.id))],
@@ -40,6 +40,13 @@ def snapshot(db):
         "Locations": [{"id": p.id, "project": p.project, "plot_number": p.plot_number, "location_label": p.location_label, "latitude": p.latitude, "longitude": p.longitude} for p in db.scalars(select(m.Plot).order_by(m.Plot.id))],
         "Customers": [{"id": u.id, "name": u.full_name, "email": u.email, "is_active": u.is_active, "created_at": iso(u.created_at)} for u in users.values() if u.role == "customer"],
     }
+    if external and not full_customer_data:
+        # Keep contact and free-text customer content in the private application.
+        for tab, keys in {"Leads":("name","phone","email","interest","preferred_time"),"Messages":("customer_name","body"),"Referrals":("referred_name","referred_phone","partner_name"),"Partners":("name","email"),"Customers":("name","email")}.items():
+            for row in data[tab]:
+                for key in keys:
+                    row[key] = ""
+    return data
 
 def csv_safe(value):
     if isinstance(value, str) and (value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@"))):
@@ -85,7 +92,7 @@ def process_once(m, mirror_factory=SheetsMirror):
                     last = last.replace(tzinfo=timezone.utc)
                 if not ids and state and state.sheet_id == sheet_id and last and now() - last < timedelta(hours=1):
                     return "idle"
-                data = snapshot(db)
+                data = snapshot(db, external=True, full_customer_data=m.settings.external_full_customer_reports)
             mirror = mirror_factory(sheet_id, m.settings.google_service_account_json.get_secret_value())
             try:
                 mirror.sync(data)
