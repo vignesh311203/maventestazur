@@ -20,7 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, select, func
+from sqlalchemy import delete, text, event, JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, Index, CheckConstraint, create_engine, select, func
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -83,6 +83,7 @@ class Role(str, Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (CheckConstraint("role IN ('admin', 'agent', 'partner', 'customer')", name="ck_users_role"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(160))
@@ -107,6 +108,7 @@ class ReportDestination(Base):
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (Index("ix_leads_status_created_at", "status", "created_at"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(160))
@@ -125,6 +127,7 @@ class Lead(Base):
 
 class Plot(Base):
     __tablename__ = "plots"
+    __table_args__ = (Index("uq_plots_project_number_ci", text("lower(trim(project))"), text("lower(trim(plot_number))"), unique=True), Index("ix_plots_status", "status"), CheckConstraint("status IN ('available', 'reserved', 'sold')", name="ck_plots_status"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project: Mapped[str] = mapped_column(String(160), index=True)
     plot_number: Mapped[str] = mapped_column(String(40))
@@ -173,7 +176,7 @@ class ReviewRequest(Base):
 
 class SupportMessage(Base):
     __tablename__ = "support_messages"
-    __table_args__ = (UniqueConstraint("customer_id", "client_id", name="uq_support_customer_client"),)
+    __table_args__ = (UniqueConstraint("customer_id", "client_id", name="uq_support_customer_client"), Index("ix_support_customer_id_id", "customer_id", "id"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     sender: Mapped[str] = mapped_column(String(16))
@@ -318,6 +321,14 @@ class PlotIn(BaseModel):
     road_width_ft: float | None = Field(default=None, gt=0, le=1000)
     photo_data: str | None = Field(default=None, max_length=2796204, exclude=True)
     remove_photo: bool = Field(default=False, exclude=True)
+
+    @field_validator("project", "plot_number")
+    @classmethod
+    def normalize_plot_label(cls, value):
+        value = value.strip()
+        if not value or any(ord(c) < 32 for c in value):
+            raise ValueError("Enter a valid project and plot number")
+        return value
 
     @model_validator(mode="after")
     def validate_location(self):
@@ -518,7 +529,12 @@ def create_lead(data: LeadIn, request: Request, db: Session = Depends(db_session
     lead = Lead(owner_id=user.id, name=user.full_name if user.role == Role.customer.value else data.name.strip(), phone=data.phone.strip(),
                 email=user.email if user.role == Role.customer.value else (str(data.email).lower() if data.email else None), interest=data.interest.strip(),
                 source="customer" if user.role == Role.customer.value else "admin", contact_consent_at=datetime.now(timezone.utc) if data.consent else None, contact_consent_version="2026-11-12" if data.consent else None)
-    db.add(lead); db.commit(); db.refresh(lead)
+    db.add(lead)
+    db.flush()
+    if user.role == Role.admin.value:
+        write_admin_audit(db, user, "lead.created", str(lead.id), None, {"status":lead.status,"source":lead.source})
+    db.commit()
+    db.refresh(lead)
     return {"id": lead.id, "status": lead.status}
 
 @app.post("/api/public/enquiries", status_code=201)
@@ -550,9 +566,12 @@ def lead_notifications(limit: int = Query(default=50, ge=1, le=200),
 @app.patch("/api/leads/{lead_id}/status")
 def update_lead(lead_id: int, new_status: str, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     if new_status not in {"new", "contacted", "qualified", "visit_booked", "won", "lost"}: raise HTTPException(status_code=422, detail="Invalid lead status")
-    lead = db.get(Lead, lead_id)
+    lead = db.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
     if not lead: raise HTTPException(status_code=404, detail="Lead not found")
-    lead.status = new_status; db.commit()
+    before = {"status": lead.status}
+    lead.status = new_status
+    write_admin_audit(db, user, "lead.status_changed", str(lead.id), before, {"status":new_status})
+    db.commit()
     return {"id": lead.id, "status": lead.status}
 
 def plot_view(p: Plot, has_photo: bool) -> dict:
@@ -609,9 +628,14 @@ def add_plot(data: PlotIn, db: Session = Depends(db_session), user: User = Depen
     jpeg = prepare_photo(data)
     plot = Plot(**data.model_dump())
     db.add(plot)
-    db.flush()
-    has_photo = apply_plot_photo(db, plot.id, data, jpeg)
-    db.commit()
+    try:
+        db.flush()
+        has_photo = apply_plot_photo(db, plot.id, data, jpeg)
+        write_admin_audit(db, user, "plot.created", str(plot.id), None, plot_audit_view(plot, has_photo))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A plot with this project and plot number already exists") from None
     db.refresh(plot)
     return plot_view(plot, has_photo)
 
@@ -634,7 +658,11 @@ def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User
     customer = db.get(User, data.customer_id)
     if not customer or customer.role != Role.customer.value: raise HTTPException(status_code=404, detail="Customer not found")
     item = ReviewRequest(customer_id=customer.id, channel=data.channel, consent_confirmed=True)
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item)
+    db.flush()
+    write_admin_audit(db, user, "review.requested", str(item.id), None, {"customer_id":customer.id,"channel":item.channel,"consent_confirmed":True})
+    db.commit()
+    db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
 
 @app.get("/api/customer/portal")
@@ -666,6 +694,8 @@ class AdminAudit(Base):
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     action: Mapped[str] = mapped_column(String(100))
     target: Mapped[str] = mapped_column(String(160), default="")
+    before_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 DEFAULT_SETTINGS = {"registration_percent":"2.0","stamp_duty_percent":"5.0","other_charges":"25000","referral_reward_amount":"0"}
@@ -686,9 +716,12 @@ class ReferralDecisionIn(BaseModel):
 class PlotUpdateIn(PlotIn):
     pass
 
-def write_admin_audit(db: Session, actor: User, action: str, target: str = ""):
-    db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160]))
-    db.commit()
+def write_admin_audit(db: Session, actor: User, action: str, target: str = "", before=None, after=None):
+    """Stage audit changes in the caller's transaction. Never store credentials or chat text."""
+    db.add(AdminAudit(actor_id=actor.id, action=action, target=target[:160], before_values=before, after_values=after))
+
+def plot_audit_view(plot, has_photo):
+    return {"project":plot.project,"plot_number":plot.plot_number,"area_sqft":plot.area_sqft,"rate_per_sqft":plot.rate_per_sqft,"status":plot.status,"corner_plot":plot.corner_plot,"corner_premium_percent":plot.corner_premium_percent,"guidance_value":plot.guidance_value,"has_photo":has_photo}
 
 @app.get("/api/settings/calculator")
 def calculator_settings(db: Session = Depends(db_session)):
@@ -702,12 +735,13 @@ def admin_get_settings(db: Session = Depends(db_session), user: User = Depends(r
 
 @app.patch("/api/admin/settings")
 def admin_update_settings(data: AdminSettingsIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    before = admin_get_settings(db, user)
     for key,value in data.model_dump().items():
-        row = db.scalar(select(AppSetting).where(AppSetting.key==key))
+        row = db.scalar(select(AppSetting).where(AppSetting.key==key).with_for_update())
         if row: row.value=str(value)
         else: db.add(AppSetting(key=key,value=str(value)))
+    write_admin_audit(db,user,"settings.updated",",".join(data.model_fields_set),before,data.model_dump())
     db.commit()
-    write_admin_audit(db,user,"settings.updated",",".join(data.model_fields_set))
     return data.model_dump()
 
 @app.get("/api/admin/users")
@@ -720,24 +754,27 @@ def admin_create_user(data: AdminUserIn, db: Session = Depends(db_session), user
     if db.scalar(select(User).where(User.email==email)): raise HTTPException(status_code=409,detail="Email already registered")
     created=User(email=email,full_name=data.full_name.strip(),password_hash=password_hash.hash(data.password),role=data.role.value)
     db.add(created)
-    try: db.commit()
+    try:
+        db.flush()
+        write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}",None,{"role":created.role,"is_active":created.is_active})
+        db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Email already registered") from None
     db.refresh(created)
-    write_admin_audit(db,user,"user.created",f"{created.id}:{created.role}")
     return {"id":created.id,"email":created.email,"full_name":created.full_name,"role":created.role,"is_active":created.is_active}
 
 @app.patch("/api/admin/users/{user_id}/active")
 def admin_set_user_active(user_id:int, active:bool, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    target=db.get(User,user_id)
+    target=db.scalar(select(User).where(User.id==user_id).with_for_update())
     if not target: raise HTTPException(status_code=404,detail="User not found")
     if target.id==user.id and not active: raise HTTPException(status_code=400,detail="You cannot deactivate your own account")
+    before = {"is_active":target.is_active}
     target.is_active=active
     if not active:
         db.execute(delete(AuthSession).where(AuthSession.user_id == target.id))
+    write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}",before,{"is_active":active})
     db.commit()
-    write_admin_audit(db,user,"user.activation_changed",f"{target.id}:{active}")
     return {"id":target.id,"is_active":target.is_active}
 
 @app.get("/api/admin/referrals")
@@ -746,30 +783,40 @@ def admin_list_referrals(db:Session=Depends(db_session), user:User=Depends(requi
 
 @app.patch("/api/admin/referrals/{referral_id}")
 def admin_decide_referral(referral_id:int, data:ReferralDecisionIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    item=db.get(Referral,referral_id)
+    item=db.scalar(select(Referral).where(Referral.id==referral_id).with_for_update())
     if not item: raise HTTPException(status_code=404,detail="Referral not found")
     if item.status == "paid" and (data.status != "paid" or data.reward_amount != item.reward_amount):
         raise HTTPException(status_code=409, detail="Paid reward records cannot be changed")
     if data.status == "paid" and (item.status not in {"approved", "paid"} or data.reward_amount != item.reward_amount):
         raise HTTPException(status_code=409, detail="Approve the reward before recording its verified payment")
-    item.status=data.status; item.reward_amount=data.reward_amount; db.commit()
-    write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}")
+    if item.status == "paid":
+        return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
+    before = {"status":item.status,"reward_amount":item.reward_amount}
+    item.status=data.status
+    item.reward_amount=data.reward_amount
+    write_admin_audit(db,user,"referral.decision",f"{item.id}:{data.status}",before,{"status":item.status,"reward_amount":item.reward_amount})
+    db.commit()
     return {"id":item.id,"status":item.status,"reward_amount":item.reward_amount}
 
 @app.patch("/api/admin/plots/{plot_id}")
 def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    item=db.get(Plot,plot_id)
-    if not item: raise HTTPException(status_code=404,detail="Plot not found")
     jpeg = prepare_photo(data)
+    item=db.scalar(select(Plot).where(Plot.id==plot_id).with_for_update())
+    if not item: raise HTTPException(status_code=404,detail="Plot not found")
+    before = plot_audit_view(item, db.get(PlotPhoto,item.id) is not None)
     for key,value in data.model_dump(exclude_unset=True).items(): setattr(item,key,value)
-    has_photo = apply_plot_photo(db, item.id, data, jpeg)
-    db.commit()
-    write_admin_audit(db,user,"plot.updated",str(item.id))
+    try:
+        has_photo = apply_plot_photo(db, item.id, data, jpeg)
+        write_admin_audit(db,user,"plot.updated",str(item.id),before,plot_audit_view(item,has_photo))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409,detail="A plot with this project and plot number already exists") from None
     return plot_view(item, has_photo)
 
 @app.get("/api/admin/audit")
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
-    return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
+    return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"before":x.before_values,"after":x.after_values,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
 
 @app.on_event("startup")
 def seed_business_settings():

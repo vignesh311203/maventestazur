@@ -223,7 +223,7 @@ def test_versioned_migration(tmp_path, monkeypatch, legacy):
         command.upgrade(cfg, "head")
         assert set(m.Base.metadata.tables).issubset(inspect(engine).get_table_names())
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_plot_media"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_security_hardening"
             if legacy:
                 assert connection.execute(text("SELECT message FROM legacy_provider_history")).scalar_one() == "preserve"
                 assert connection.execute(text("SELECT value FROM app_settings WHERE key='registration_percent'")).scalar_one() == "7"
@@ -809,3 +809,37 @@ def test_advisor_consent_and_customer_isolation(client,monkeypatch):
     assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="A plot fits your budget."
     assert send("Book Site Visit",3,True).status_code==201
     assert len(seen)==1
+
+
+def test_duplicate_plot_and_atomic_audit(client, monkeypatch):
+    admin = login(client,"admin@example.com","TestAdminPass123!")
+    data={"project":"Unique Enclave","plot_number":"P1","area_sqft":1200,"rate_per_sqft":3500}
+    result=client.post("/api/plots",headers=admin,json=data)
+    assert result.status_code==201,result.text
+    pid=result.json()["id"]
+    assert client.post("/api/plots",headers=admin,json={**data,"project":" unique enclave ","plot_number":"p1"}).status_code==409
+    assert client.patch(f"/api/admin/plots/{pid}",headers=admin,json={**data,"rate_per_sqft":3600}).status_code==200
+    audit=client.get("/api/admin/audit",headers=admin).json()
+    change=next(x for x in audit if x["action"]=="plot.updated")
+    assert change["before"]["rate_per_sqft"]==3500 and change["after"]["rate_per_sqft"]==3600
+    original=m.write_admin_audit
+    def fail_audit(*args,**kwargs):
+        raise RuntimeError("Simulated audit failure")
+    monkeypatch.setattr(m,"write_admin_audit",fail_audit)
+    with pytest.raises(RuntimeError):
+        client.post("/api/plots",headers=admin,json={**data,"plot_number":"P2"})
+    monkeypatch.setattr(m,"write_admin_audit",original)
+    assert len(client.get("/api/plots").json())==1
+
+
+def test_referral_paid_idempotent_and_audited(client):
+    admin=login(client,"admin@example.com","TestAdminPass123!")
+    _,partner=make_user(client,admin,"referral-lock@example.com","partner")
+    rid=client.post("/api/partners/referrals",headers=partner,json={"referred_name":"Test Referral","referred_phone":"9999999999"}).json()["id"]
+    url=f"/api/admin/referrals/{rid}"
+    assert client.patch(url,headers=admin,json={"status":"approved","reward_amount":1000}).status_code==200
+    for _ in range(2):
+        assert client.patch(url,headers=admin,json={"status":"paid","reward_amount":1000}).status_code==200
+    records=[x for x in client.get("/api/admin/audit",headers=admin).json() if x["action"]=="referral.decision"]
+    assert len(records)==2 and records[0]["before"]["status"]=="approved" and records[0]["after"]["status"]=="paid"
+    assert client.patch(url,headers=admin,json={"status":"paid","reward_amount":2000}).status_code==409

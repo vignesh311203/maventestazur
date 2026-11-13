@@ -47,7 +47,7 @@ jobs:
       - name: Check exposed files and API schema version
         run: |
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/.env)" = "403"
-          docker compose exec -T api alembic current | grep '0008_plot_media'
+          docker compose exec -T api alembic current | grep '0009_security_hardening'
       - name: Install browser test dependencies
         working-directory: frontend
         run: |
