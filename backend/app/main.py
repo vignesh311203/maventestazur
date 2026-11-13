@@ -5,6 +5,13 @@ from .finance import router as finance_router
 from enum import Enum
 from typing import Generator, Literal
 from math import expm1, log1p
+from contextlib import asynccontextmanager
+import logging
+import time
+import uuid
+from limits import parse
+from starlette.concurrency import run_in_threadpool
+from .request_security import client_ip, account_key
 import jwt
 import hashlib
 import hmac
@@ -26,7 +33,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 class Settings(BaseSettings):
     app_env: str = "development"
@@ -36,6 +42,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     redis_url: str = ""
     trusted_hosts: str = "localhost,127.0.0.1,testserver"
+    client_ip_mode: Literal["socket", "railway"] = "socket"
+    public_base_url: str = ""
+    external_full_customer_reports: bool = False
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     ai_enabled: bool = False
@@ -195,8 +204,23 @@ class ChatState(Base):
 password_hash = PasswordHash.recommended()
 _dummy_password_hash = password_hash.hash(secrets.token_urlsafe(32))
 bearer = HTTPBearer(auto_error=False)
-limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url or "memory://")
-app = FastAPI(title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
+logger = logging.getLogger("uvicorn.error")
+def rate_key(request: Request):
+    return client_ip(request, settings.client_ip_mode, settings.trusted_hosts)
+
+limiter = Limiter(key_func=rate_key, storage_uri=settings.redis_url or "memory://")
+
+@asynccontextmanager
+async def lifespan(application):
+    bootstrap_admin()
+    seed_business_settings()
+    start_sheets_worker()
+    try:
+        yield
+    finally:
+        stop_sheets_worker()
+
+app = FastAPI(lifespan=lifespan, title="Real Estate Platform API", version="0.1.0", docs_url="/docs" if settings.app_env != "production" else None, redoc_url=None, openapi_url="/openapi.json" if settings.app_env != "production" else None)
 app.include_router(finance_router)
 app.state.limiter = limiter
 if settings.app_env == "production":
@@ -207,6 +231,39 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]})
 app.add_middleware(CORSMiddleware, allow_origins=[v.strip() for v in settings.cors_origins.split(",") if v.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-Session-Panel"])
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    response = None
+    try:
+        if request.url.path.startswith("/api/") and request.method != "OPTIONS":
+            def permitted():
+                key = rate_key(request)
+                if not limiter._limiter.hit(parse("300/minute"), "api-global", key):
+                    return False
+                if request.url.path.startswith(("/api/finance/", "/api/calculators/")):
+                    return limiter._limiter.hit(parse("60/minute"), "finance", key)
+                return True
+            try:
+                allowed = await run_in_threadpool(permitted)
+            except Exception:
+                logger.error("rate_limit_unavailable request_id=%s", request_id)
+                response = JSONResponse(status_code=503, content={"detail":"Service temporarily unavailable"}, headers={"Cache-Control":"no-store"})
+            else:
+                if not allowed:
+                    response = JSONResponse(status_code=429, content={"detail":"Too many requests. Try again shortly."}, headers={"Retry-After":"60","Cache-Control":"no-store"})
+        if response is None:
+            response = await call_next(request)
+    except Exception as exc:
+        logger.error("request_failed request_id=%s error_type=%s", request_id, type(exc).__name__)
+        raise
+    response.headers["X-Request-ID"] = request_id
+    route = request.scope.get("route")
+    route_name = getattr(route, "path", "unmatched")
+    logger.info("request_id=%s method=%s route=%s status=%s duration_ms=%.1f", request_id, request.method, route_name, response.status_code, (time.monotonic()-started)*1000)
+    return response
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -468,6 +525,9 @@ def register(data: RegisterIn, request: Request, response: Response, db: Session
 @limiter.limit("10/minute")
 def login(data: LoginIn, request: Request, response: Response, db: Session = Depends(db_session)):
     browser_panel(request)
+    key = account_key(settings.app_secret_key, str(data.email))
+    if not limiter._limiter.hit(parse("10/15 minutes"), "login-account", key):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in 15 minutes.", headers={"Retry-After":"900"})
     user = db.scalar(select(User).where(User.email == data.email.lower()))
     valid = password_hash.verify(data.password, user.password_hash if user else _dummy_password_hash)
     if not user or not valid or not user.is_active: raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -670,7 +730,6 @@ def customer_portal(db: Session = Depends(db_session), user: User = Depends(requ
     refs = list(db.scalars(select(Referral).where(Referral.referrer_id == user.id)))
     return {"profile": {"id": user.id, "name": user.full_name, "email": user.email}, "referrals": [{"id": r.id, "status": r.status} for r in refs], "message": "Booking, payment and document records require verified business-system integration"}
 
-@app.on_event("startup")
 def bootstrap_admin():
     if not settings.bootstrap_admin_email or not settings.bootstrap_admin_password: return
     with SessionLocal() as db:
@@ -818,7 +877,6 @@ def admin_update_plot(plot_id:int, data:PlotUpdateIn, db:Session=Depends(db_sess
 def admin_audit_log(limit:int=Query(default=100,ge=1,le=500), db:Session=Depends(db_session), user:User=Depends(require_roles(Role.admin))):
     return [{"id":x.id,"actor_id":x.actor_id,"action":x.action,"target":x.target,"before":x.before_values,"after":x.after_values,"created_at":x.created_at.isoformat()} for x in db.scalars(select(AdminAudit).order_by(AdminAudit.id.desc()).limit(limit))]
 
-@app.on_event("startup")
 def seed_business_settings():
     with SessionLocal() as db:
         for key,value in DEFAULT_SETTINGS.items():
@@ -1111,14 +1169,12 @@ def export_reporting_data(request: Request, db: Session = Depends(db_session), u
     return Response(export_zip(snapshot(db)), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="metroestate-private-report.zip"'})
 
 
-@app.on_event("startup")
 def start_sheets_worker():
     from . import main
     from .sheet_sync import start_worker
     app.state.sheet_stop, app.state.sheet_worker = start_worker(main)
 
 
-@app.on_event("shutdown")
 def stop_sheets_worker():
     stop = getattr(app.state, "sheet_stop", None)
     worker = getattr(app.state, "sheet_worker", None)

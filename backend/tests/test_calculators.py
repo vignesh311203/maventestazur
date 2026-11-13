@@ -843,3 +843,19 @@ def test_referral_paid_idempotent_and_audited(client):
     records=[x for x in client.get("/api/admin/audit",headers=admin).json() if x["action"]=="referral.decision"]
     assert len(records)==2 and records[0]["before"]["status"]=="approved" and records[0]["after"]["status"]=="paid"
     assert client.patch(url,headers=admin,json={"status":"paid","reward_amount":2000}).status_code==409
+
+
+def test_proxy_account_throttle_and_request_ids(client,monkeypatch):
+    from starlette.requests import Request
+    from app.request_security import client_ip
+    scope={"type":"http","client":("127.0.0.1",5000),"headers":[(b"host",b"testserver"),(b"x-real-ip",b"203.0.113.10"),(b"x-forwarded-for",b"1.2.3.4")]}
+    assert client_ip(Request(scope),"socket","testserver")=="127.0.0.1"
+    assert client_ip(Request(scope),"railway","testserver")=="203.0.113.10"
+    monkeypatch.setattr(m.settings,"client_ip_mode","railway")
+    for i in range(10):
+        res=client.post("/api/auth/login",headers={"X-Real-IP":f"203.0.113.{i+1}"},json={"email":"unknown@example.com","password":"wrong"})
+        assert res.status_code==401
+    res=client.post("/api/auth/login",headers={"X-Real-IP":"203.0.113.50"},json={"email":"unknown@example.com","password":"wrong"})
+    assert res.status_code==429 and res.headers["retry-after"]=="900"
+    assert len(res.headers["x-request-id"])==32
+    assert client.post("/api/auth/login",headers={"X-Real-IP":"203.0.113.50"},json={"email":"admin@example.com","password":"TestAdminPass123!"}).status_code==200
