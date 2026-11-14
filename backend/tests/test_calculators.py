@@ -908,3 +908,49 @@ def test_ai_fallback_committed_before_provider(client,monkeypatch):
     assert client.post("/api/customer/messages",headers=customer,json=body).status_code==201
     assert len(calls)==1
     assert client.get("/api/customer/messages",headers=customer).json()[-1]["body"]=="Loan explanation."
+
+
+def test_human_support_handoff_notifications_and_resume(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "handoff-customer@example.com")
+    other = register(client, "handoff-other@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    inbox = "/api/admin/message-notifications"
+    assert client.get(inbox, headers=customer).status_code == 403
+    assert client.get(inbox, headers=admin).json()["pending_count"] == 0
+    assert client.get("/api/customer/chat-state", headers=customer).json()["mode"] == "assistant"
+    assert client.post("/api/customer/chat-mode", headers=customer, json={"mode": "team"}).status_code == 200
+    assert client.get("/api/customer/chat-state", headers=customer).json()["quick"] == []
+    payload = {"body": "Can a staff member help me?", "client_id": "handoff-message-0001", "ai_consent": True}
+    first = client.post("/api/customer/messages", headers=customer, json=payload)
+    assert first.status_code == 201, first.text
+    assert client.post("/api/customer/messages", headers=customer, json=payload).json()["id"] == first.json()["id"]
+    assert [x["sender"] for x in client.get("/api/customer/messages", headers=customer).json()] == ["customer"]
+    result = client.get(inbox, headers=admin).json()
+    assert result["pending_count"] == 1
+    assert result["items"][0]["customer_id"] == customer_id
+    assert result["items"][0]["message_id"] == first.json()["id"]
+    assert client.get("/api/customer/messages", headers=other).json() == []
+    reply = {"body": "Our property team is here to help.", "client_id": "handoff-admin-000001"}
+    assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=reply).status_code == 201
+    assert client.get(inbox, headers=admin).json()["pending_count"] == 0
+    assert client.post("/api/customer/messages", headers=customer, json=payload | {"client_id": "handoff-message-0002"}).status_code == 201
+    assert [x["sender"] for x in client.get("/api/customer/messages", headers=customer).json()] == ["customer", "admin", "customer"]
+    assert client.get(inbox, headers=admin).json()["pending_count"] == 1
+    assert client.post("/api/customer/chat-mode", headers=customer, json={"mode": "assistant"}).status_code == 200
+    assert client.get(inbox, headers=admin).json()["pending_count"] == 0
+    assert client.post("/api/customer/messages", headers=customer, json=payload | {"body": "What is the plot price?", "client_id": "handoff-message-0003", "ai_consent": False}).status_code == 201
+    assert client.get("/api/customer/messages", headers=customer).json()[-1]["sender"] == "assistant"
+    assert client.post(f"/api/admin/messages/{customer_id}", headers=admin, json=reply | {"client_id": "handoff-admin-000002"}).status_code == 201
+    assert client.get("/api/customer/chat-state", headers=customer).json()["mode"] == "team"
+
+
+def test_admin_review_history_access(client):
+    admin = login(client, "admin@example.com", "TestAdminPass123!")
+    customer = register(client, "review-history@example.com")
+    customer_id = client.get("/api/me", headers=customer).json()["id"]
+    assert client.get("/api/admin/review-requests", headers=customer).status_code == 403
+    assert client.post("/api/reviews/requests", headers=admin, json={"customer_id": customer_id, "channel": "manual", "consent_confirmed": True}).status_code == 201
+    rows = client.get("/api/admin/review-requests", headers=admin).json()
+    assert len(rows) == 1 and rows[0]["customer_id"] == customer_id
+    assert rows[0]["delivery"] == "not_configured" and rows[0]["consent_confirmed"] is True
