@@ -7,7 +7,7 @@ const dateLabel=value=>new Date(value).toLocaleString("en-IN");
 export default function SupportChat({token,admin=false,initialCustomerId=null}){
  const [threads,setThreads]=useState([]),[selected,setSelected]=useState(initialCustomerId),[messages,setMessages]=useState([]),[draft,setDraft]=useState(""),[busy,setBusy]=useState(false),[error,setError]=useState(""),[older,setOlder]=useState(false);
  const [quick,setQuick]=useState(menu),[inProgress,setInProgress]=useState(false),[aiAvailable,setAiAvailable]=useState(false),[aiConsent,setAiConsent]=useState(false),[mode,setMode]=useState(null),[refreshing,setRefreshing]=useState(false),[lastUpdated,setLastUpdated]=useState(null),[notice,setNotice]=useState("");
- const attempt=useRef(null), historyRef=useRef(null), refreshRef=useRef(null), operation=useRef(false), scrollBottom=useRef(true);
+ const attempt=useRef(null), historyRef=useRef(null), refreshRef=useRef(null), operation=useRef(false), scrollBottom=useRef(true),version=useRef(0);
  const path=admin?selected?"/api/admin/messages/"+selected:null:"/api/customer/messages";
  const selectedThread=threads.find(t=>t.customer_id===selected);
  useEffect(()=>{if(historyRef.current&&scrollBottom.current)historyRef.current.scrollTop=historyRef.current.scrollHeight},[messages,selected]);
@@ -22,18 +22,18 @@ export default function SupportChat({token,admin=false,initialCustomerId=null}){
    let active=true, inFlight=false;
    async function refresh(manual=false){
      if((document.hidden&&!manual)||inFlight||operation.current)return;
-     inFlight=true;if(manual)setRefreshing(true);
+     inFlight=true;const requestVersion=version.current;if(manual)setRefreshing(true);
      try{
        const tasks=[];
-       if(admin)tasks.push(api("/api/admin/messages?limit=200").then(rows=>{if(active)setThreads(rows)}));
-       else tasks.push(api("/api/customer/chat-state").then(state=>{if(active)applyState(state)}));
-       if(path)tasks.push(api(path+"?limit=50").then(rows=>{if(active){setMessages(prev=>merge(prev,rows));setOlder(prev=>prev||rows.length===50);}}));
+       if(admin)tasks.push(api("/api/admin/messages?limit=200").then(rows=>{if(active&&requestVersion===version.current)setThreads(rows)}));
+       else tasks.push(api("/api/customer/chat-state").then(state=>{if(active&&requestVersion===version.current)applyState(state)}));
+       if(path)tasks.push(api(path+"?limit=50").then(rows=>{if(active&&requestVersion===version.current){setMessages(prev=>merge(prev,rows));setOlder(prev=>prev||rows.length===50);}}));
        const results=await Promise.allSettled(tasks);
-       if(!active)return;
+       if(!active||requestVersion!==version.current)return;
        const failure=results.find(x=>x.status==="rejected");
        if(failure)throw failure.reason;
        setError("");setLastUpdated(new Date());if(manual)setNotice("Messages refreshed.");
-     }catch(e){if(active)setError(e.message);}
+     }catch(e){if(active&&requestVersion===version.current)setError(e.message);}
      finally{inFlight=false;if(active)setRefreshing(false);}
    }
    setMessages([]);setOlder(false);setDraft("");setError("");setNotice("");setLastUpdated(null);setRefreshing(false);attempt.current=null;scrollBottom.current=true;
@@ -42,7 +42,7 @@ export default function SupportChat({token,admin=false,initialCustomerId=null}){
  },[token,admin,selected]);
  async function changeMode(next){
    if(admin||operation.current||refreshing||mode===next)return;
-   operation.current=true;setBusy(true);setError("");setNotice("");
+   operation.current=true;version.current++;setBusy(true);setError("");setNotice("");
    try{
      await api("/api/customer/chat-mode",{mode:next});
      applyState(await api("/api/customer/chat-state"));
@@ -54,7 +54,7 @@ export default function SupportChat({token,admin=false,initialCustomerId=null}){
    e.preventDefault();const body=(quickBody??draft).trim();if(operation.current||refreshing||!path||!body||(!admin&&!mode))return;
    const consent=!admin&&mode==="assistant"&&!quickBody&&aiConsent;
    if(!attempt.current||attempt.current.body!==body||attempt.current.ai_consent!==consent)attempt.current={body,client_id:crypto.randomUUID(),ai_consent:consent};
-   operation.current=true;setBusy(true);setError("");setNotice("");
+   operation.current=true;version.current++;setBusy(true);setError("");setNotice("");
    try{
      const saved=await api(path,attempt.current);
      attempt.current=null;if(!quickBody)setDraft("");
@@ -69,7 +69,7 @@ export default function SupportChat({token,admin=false,initialCustomerId=null}){
  }
  async function loadOlder(){
    if(!messages.length||!path||operation.current||refreshing)return;
-   operation.current=true;setBusy(true);setError("");
+   operation.current=true;version.current++;setBusy(true);setError("");
    try{
      const el=historyRef.current, previousHeight=el?.scrollHeight||0, previousTop=el?.scrollTop||0;
      scrollBottom.current=false;
