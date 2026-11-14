@@ -22,7 +22,7 @@ export default function SupportChat({token,admin=false,initialCustomerId=null}){
    let active=true, inFlight=false;
    async function refresh(manual=false){
      if((document.hidden&&!manual)||inFlight||operation.current)return;
-     inFlight=true;const requestVersion=version.current;if(manual)setRefreshing(true);
+     inFlight=true;const requestVersion=version.current;setRefreshing(true);
      try{
        const tasks=[];
        if(admin)tasks.push(api("/api/admin/messages?limit=200").then(rows=>{if(active&&requestVersion===version.current)setThreads(rows)}));
