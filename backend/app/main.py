@@ -725,6 +725,14 @@ def request_review(data: ReviewIn, db: Session = Depends(db_session), user: User
     db.refresh(item)
     return {"id": item.id, "status": item.status, "delivery": "not_configured"}
 
+@app.get("/api/admin/review-requests")
+def admin_review_requests(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    stmt = select(ReviewRequest, User).join(User, User.id == ReviewRequest.customer_id).order_by(ReviewRequest.id.desc()).limit(100)
+    return [{"id": item.id, "customer_id": customer.id, "customer_name": customer.full_name,
+             "channel": item.channel, "status": item.status, "consent_confirmed": item.consent_confirmed,
+             "created_at": item.created_at.isoformat(), "delivery": "not_configured"} for item, customer in db.execute(stmt)]
+
+
 @app.get("/api/customer/portal")
 def customer_portal(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
     refs = list(db.scalars(select(Referral).where(Referral.referrer_id == user.id)))
@@ -916,6 +924,33 @@ def plot_tool_handlers() -> dict:
     return {"search_plots": search_plots, "plot_base_price": plot_base_price}
 
 
+class SupportModeIn(BaseModel):
+    mode: Literal["assistant", "team"]
+
+
+def support_mode(db: Session, customer_id: int, state: ChatState | None = None) -> str:
+    state = state if state is not None else db.get(ChatState, customer_id)
+    explicit = (state.state or {}).get("support_mode") if state else None
+    if explicit in {"assistant", "team"}:
+        return explicit
+    # Existing conversations with a human reply remain human-owned after upgrade.
+    previous = db.scalar(select(SupportMessage.id).where(
+        SupportMessage.customer_id == customer_id, SupportMessage.sender == "admin"
+    ).limit(1))
+    return "team" if previous is not None else "assistant"
+
+
+def set_support_mode(db: Session, customer_id: int, mode: str) -> ChatState:
+    state = db.get(ChatState, customer_id)
+    if state is None:
+        state = ChatState(customer_id=customer_id, state={}, quick=[])
+        db.add(state)
+    if (state.state or {}).get("support_mode") != mode:
+        state.state = {"support_mode": mode}
+        state.quick = list(MENU) if mode == "assistant" else []
+    return state
+
+
 class SupportMessageIn(BaseModel):
     body: str = Field(min_length=1, max_length=2000)
     client_id: str = Field(min_length=16, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
@@ -959,16 +994,19 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
     assistant = None
     try:
         db.flush()
-        if sender == "customer":
+        if sender == "admin":
+            set_support_mode(db, customer_id, "team")
+        if sender == "customer" and support_mode(db, customer_id) == "assistant":
             state = db.get(ChatState, customer_id)
             if state is None:
                 state = ChatState(customer_id=customer_id, state={}, quick=list(MENU))
                 db.add(state)
             projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
-            reply = respond(data.body, customer.full_name, state.state, projects, available)
+            flow_state = {k: v for k, v in (state.state or {}).items() if k != "support_mode"}
+            reply = respond(data.body, customer.full_name, flow_state, projects, available)
             # Collect bounded public data and consented context; persist a fallback first.
-            if data.ai_consent and ai_configured() and not reply.lead and reply.state == (state.state or {}):
+            if data.ai_consent and ai_configured() and not reply.lead and reply.state == flow_state:
                 if settings.ai_provider == "anthropic":
                     from .agent_ai import converse, agent_eligible
                     if agent_eligible(data.body):
@@ -980,7 +1018,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                     if eligible_question(data.body):
                         inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
                         ai_job = (answer_question, (data.body, inventory, settings.openai_api_key.get_secret_value(), settings.openai_model))
-            state.state, state.quick = reply.state, reply.quick
+            state.state, state.quick = {**reply.state, "support_mode": "assistant"}, reply.quick
             assistant = SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text)
             db.add(assistant)
             if reply.lead:
@@ -1016,7 +1054,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                 active = update_db.scalar(select(User).where(User.id == customer_id).with_for_update())
                 latest = update_db.scalar(select(func.max(SupportMessage.id)).where(SupportMessage.customer_id == customer_id))
                 saved = update_db.get(SupportMessage, assistant_id)
-                if active and active.is_active and latest == assistant_id and saved and saved.body == reply.text:
+                if active and active.is_active and latest == assistant_id and saved and saved.body == reply.text and support_mode(update_db, customer_id) == "assistant":
                     saved.body = ai_text[:2000]
                     update_db.commit()
     return result
@@ -1025,7 +1063,21 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
 @app.get("/api/customer/chat-state")
 def customer_chat_state(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
     state = db.get(ChatState, user.id)
-    return {"quick": state.quick if state else MENU, "in_progress": bool(state and state.state.get("flow")), "ai_available": ai_configured()}
+    mode = support_mode(db, user.id, state)
+    return {"mode": mode, "quick": (state.quick if state else MENU) if mode == "assistant" else [],
+            "in_progress": mode == "assistant" and bool(state and (state.state or {}).get("flow")),
+            "ai_available": mode == "assistant" and ai_configured()}
+
+
+@app.post("/api/customer/chat-mode")
+@limiter.limit("20/minute")
+def customer_chat_mode(request: Request, data: SupportModeIn, db: Session = Depends(db_session), user: User = Depends(require_roles(Role.customer))):
+    customer = db.scalar(select(User).where(User.id == user.id).with_for_update())
+    if not customer or not customer.is_active:
+        raise HTTPException(status_code=409, detail="Customer account is inactive")
+    set_support_mode(db, user.id, data.mode)
+    db.commit()
+    return {"mode": data.mode}
 
 
 @app.get("/api/customer/messages")
@@ -1043,7 +1095,36 @@ def send_customer_message(request: Request, data: SupportMessageIn, db: Session 
 def admin_message_threads(limit: int = Query(default=100, ge=1, le=200), db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
     latest = select(SupportMessage.customer_id, func.max(SupportMessage.id).label("latest_id")).where(SupportMessage.sender != "assistant").group_by(SupportMessage.customer_id).subquery()
     stmt = select(User, SupportMessage).join(latest, latest.c.customer_id == User.id).join(SupportMessage, SupportMessage.id == latest.c.latest_id).where(User.role == Role.customer.value).order_by(SupportMessage.id.desc()).limit(limit)
-    return [{"customer_id": customer.id, "name": customer.full_name, "email": customer.email, "last_message": message.body, "updated_at": message.created_at.isoformat(), "awaiting_reply": message.sender == "customer"} for customer, message in db.execute(stmt)]
+    result = []
+    for customer, message in db.execute(stmt):
+        mode = support_mode(db, customer.id)
+        result.append({"customer_id": customer.id, "name": customer.full_name, "email": customer.email,
+                       "last_message": message.body, "updated_at": message.created_at.isoformat(),
+                       "last_message_id": message.id, "mode": mode,
+                       "awaiting_reply": message.sender == "customer",
+                       "team_pending": mode == "team" and message.sender == "customer"})
+    return result
+
+
+@app.get("/api/admin/message-notifications")
+def admin_message_notifications(db: Session = Depends(db_session), user: User = Depends(require_roles(Role.admin))):
+    latest = select(SupportMessage.customer_id, func.max(SupportMessage.id).label("latest_id")).where(
+        SupportMessage.sender != "assistant").group_by(SupportMessage.customer_id).subquery()
+    explicit = ChatState.state["support_mode"].as_string()
+    previous_admin = select(func.count(SupportMessage.id)).where(
+        SupportMessage.customer_id == User.id, SupportMessage.sender == "admin").correlate(User).scalar_subquery()
+    pending = (select(User.id.label("customer_id"), User.full_name.label("name"),
+                      SupportMessage.id.label("message_id"), SupportMessage.created_at)
+               .join(latest, latest.c.customer_id == User.id)
+               .join(SupportMessage, SupportMessage.id == latest.c.latest_id)
+               .outerjoin(ChatState, ChatState.customer_id == User.id)
+               .where(User.role == Role.customer.value, User.is_active.is_(True),
+                      SupportMessage.sender == "customer",
+                      (explicit == "team") | (explicit.is_(None) & (previous_admin > 0))))
+    count = db.scalar(select(func.count()).select_from(pending.subquery())) or 0
+    rows = db.execute(pending.order_by(SupportMessage.id.desc()).limit(50))
+    return {"pending_count": count, "items": [{"customer_id": row.customer_id, "name": row.name,
+             "message_id": row.message_id, "received_at": row.created_at.isoformat()} for row in rows]}
 
 
 def support_customer(db: Session, customer_id: int):
