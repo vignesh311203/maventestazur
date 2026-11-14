@@ -1115,7 +1115,7 @@ def admin_message_notifications(db: Session = Depends(db_session), user: User = 
         SupportMessage.customer_id == User.id, SupportMessage.sender == "admin").correlate(User).scalar_subquery()
     pending = (select(User.id.label("customer_id"), User.full_name.label("name"),
                       SupportMessage.id.label("message_id"), SupportMessage.created_at)
-               .join(latest, latest.c.customer_id == User.id)
+               .select_from(User).join(latest, latest.c.customer_id == User.id)
                .join(SupportMessage, SupportMessage.id == latest.c.latest_id)
                .outerjoin(ChatState, ChatState.customer_id == User.id)
                .where(User.role == Role.customer.value, User.is_active.is_(True),
