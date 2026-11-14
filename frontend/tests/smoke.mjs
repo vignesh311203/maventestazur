@@ -93,7 +93,7 @@ try{
   console.log("PASS all three conversational requests, persistence and private lead creation");
   await page.goto(web+"/admin");await signIn(customerEmail,customerPassword);await page.getByText(/cannot access this panel/).waitFor();assert.equal(await page.getByRole("heading",{name:"Registered users"}).count(),0);
   console.log("PASS customer denied admin panel");
-  await signIn(adminEmail,adminPassword);await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();await nav("Reviews");await page.getByLabel("Customer account ID").fill(String(customer.user.id));await page.getByRole("checkbox",{name:/explicitly agreed/}).check();const review=page.waitForResponse(r=>r.url().endsWith("/api/reviews/requests")&&r.request().method()==="POST");await page.getByRole("button",{name:"Record review request"}).click();assert.equal((await review).status(),201);
+  await signIn(adminEmail,adminPassword);await page.getByRole("heading",{name:"New enquiry notifications"}).waitFor();await nav("Reviews");await page.getByLabel("Customer account ID").selectOption(String(customer.user.id));await page.getByRole("checkbox",{name:/explicitly agreed/}).check();const review=page.waitForResponse(r=>r.url().endsWith("/api/reviews/requests")&&r.request().method()==="POST");await page.getByRole("button",{name:"Record review request"}).click();assert.equal((await review).status(),201);
   console.log("PASS manual review consent");
   await nav("Sheets");await page.getByRole("heading",{name:"Google Sheets synchronization"}).waitFor();await page.getByText("Not configured — records saved in PostgreSQL",{exact:true}).waitFor();
   assert.equal((await page.request.get(api+"/api/admin/sheets/export",{headers:customerHeaders})).status(),403);
