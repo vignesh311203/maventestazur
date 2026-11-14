@@ -946,7 +946,8 @@ def set_support_mode(db: Session, customer_id: int, mode: str) -> ChatState:
         state = ChatState(customer_id=customer_id, state={}, quick=[])
         db.add(state)
     if (state.state or {}).get("support_mode") != mode:
-        state.state = {"support_mode": mode}
+        boundary = db.scalar(select(func.max(SupportMessage.id)).where(SupportMessage.customer_id == customer_id)) or 0
+        state.state = {"support_mode": mode, "assistant_context_after_id": boundary}
         state.quick = list(MENU) if mode == "assistant" else []
     return state
 
@@ -1003,14 +1004,15 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                 db.add(state)
             projects = list(db.scalars(select(Plot.project).where(Plot.status == "available").distinct().order_by(Plot.project).limit(20)))
             available = db.scalar(select(func.count(Plot.id)).where(Plot.status == "available")) or 0
-            flow_state = {k: v for k, v in (state.state or {}).items() if k != "support_mode"}
+            context_boundary = (state.state or {}).get("assistant_context_after_id", 0)
+            flow_state = {k: v for k, v in (state.state or {}).items() if k not in {"support_mode", "assistant_context_after_id"}}
             reply = respond(data.body, customer.full_name, flow_state, projects, available)
             # Collect bounded public data and consented context; persist a fallback first.
             if data.ai_consent and ai_configured() and not reply.lead and reply.state == flow_state:
                 if settings.ai_provider == "anthropic":
                     from .agent_ai import converse, agent_eligible
                     if agent_eligible(data.body):
-                        recent = list(db.scalars(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.sender.in_(["customer", "assistant"])).order_by(SupportMessage.id.desc()).limit(14)))
+                        recent = list(db.scalars(select(SupportMessage).where(SupportMessage.customer_id == customer_id, SupportMessage.id > context_boundary, SupportMessage.sender.in_(["customer", "assistant"])).order_by(SupportMessage.id.desc()).limit(14)))
                         history = [{"sender": x.sender, "body": x.body} for x in reversed(recent)]
                         ai_job = (converse, (history, plot_tool_handlers(), settings.anthropic_api_key.get_secret_value(), settings.anthropic_model, settings.assistant_name))
                 else:
@@ -1018,7 +1020,7 @@ def save_support(db: Session, customer_id: int, sender: str, data: SupportMessag
                     if eligible_question(data.body):
                         inventory = [{"project": p.project, "plot": p.plot_number, "area_sqft": p.area_sqft, "rate_per_sqft": p.rate_per_sqft, "location": p.location_label} for p in db.scalars(select(Plot).where(Plot.status == "available").order_by(Plot.id).limit(40))]
                         ai_job = (answer_question, (data.body, inventory, settings.openai_api_key.get_secret_value(), settings.openai_model))
-            state.state, state.quick = {**reply.state, "support_mode": "assistant"}, reply.quick
+            state.state, state.quick = {**reply.state, "support_mode": "assistant", "assistant_context_after_id": context_boundary}, reply.quick
             assistant = SupportMessage(customer_id=customer_id, sender="assistant", client_id="assistant:" + data.client_id, body=reply.text)
             db.add(assistant)
             if reply.lead:
